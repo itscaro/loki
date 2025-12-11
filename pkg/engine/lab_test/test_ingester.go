@@ -79,6 +79,7 @@ import (
 	"github.com/grafana/loki/v3/pkg/dataobj"
 	"github.com/grafana/loki/v3/pkg/dataobj/consumer/logsobj"
 	"github.com/grafana/loki/v3/pkg/dataobj/metastore"
+	"github.com/grafana/loki/v3/pkg/dataobj/sections/logs"
 	"github.com/grafana/loki/v3/pkg/dataobj/uploader"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/physical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/types"
@@ -173,12 +174,24 @@ type TestIngester struct {
 	uploader *uploader.Uploader
 	builder  *logsobj.Builder
 
-	// Track uploaded object paths for cleanup
-	uploadedPaths []string
+	// Track uploaded object descriptors for catalog
+	objects []objectDescriptor
+
+	// Track tenants that have been used
+	tenants map[string]struct{}
 
 	// Catalog for querying
 	metastore *metastore.ObjectMetastore
 	catalog   physical.Catalog
+}
+
+// objectDescriptor tracks metadata about uploaded objects for the catalog
+type objectDescriptor struct {
+	path      string
+	tenant    string
+	streamIDs []int64
+	minTime   time.Time
+	maxTime   time.Time
 }
 
 // NewTestIngester creates a new TestIngester.
@@ -232,21 +245,30 @@ func NewTestIngester(cfg TestIngesterConfig) (*TestIngester, error) {
 	// Create metastore for querying
 	ms := metastore.NewObjectMetastore(bucket, logger, nil)
 
-	return &TestIngester{
+	ti := &TestIngester{
 		cfg:       cfg,
 		logger:    logger,
 		bucket:    bucket,
 		uploader:  up,
 		builder:   builder,
 		metastore: ms,
-		catalog:   NewTestCatalog(ms),
-	}, nil
+		tenants:   make(map[string]struct{}),
+		objects:   make([]objectDescriptor, 0),
+	}
+
+	// Create catalog that uses tracked object metadata
+	ti.catalog = NewTestCatalog(ti)
+
+	return ti, nil
 }
 
 // Push ingests log entries for a tenant.
 func (ti *TestIngester) Push(ctx context.Context, tenant string, entries []LogEntry) error {
 	ti.mu.Lock()
 	defer ti.mu.Unlock()
+
+	// Track tenants for catalog queries
+	ti.tenants[tenant] = struct{}{}
 
 	// Group entries by labels (stream)
 	streamsByLabels := make(map[string][]LogEntry)
@@ -336,6 +358,9 @@ func (ti *TestIngester) Flush(ctx context.Context) ([]string, error) {
 }
 
 func (ti *TestIngester) flush(ctx context.Context) ([]string, error) {
+	// Get time ranges BEFORE flushing (flush clears the builder state)
+	timeRanges := ti.builder.TimeRanges()
+
 	obj, closer, err := ti.builder.Flush()
 	if err != nil {
 		if err == logsobj.ErrBuilderEmpty {
@@ -351,7 +376,45 @@ func (ti *TestIngester) flush(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("uploading object: %w", err)
 	}
 
-	ti.uploadedPaths = append(ti.uploadedPaths, path)
+	// Track object metadata for catalog (simplified approach for testing)
+	for _, tr := range timeRanges {
+		// Get stream IDs from the object
+		var streamIDs []int64
+		for _, section := range obj.Sections().Filter(logs.CheckSection) {
+			if section.Tenant != tr.Tenant {
+				continue
+			}
+
+			logsSection, err := logs.Open(ctx, section)
+			if err != nil {
+				continue
+			}
+
+			// Collect unique stream IDs
+			streamIDSet := make(map[int64]struct{})
+			iter := logs.IterSection(ctx, logsSection)
+			for rec := range iter {
+				val, err := rec.Value()
+				if err != nil {
+					continue
+				}
+				streamIDSet[val.StreamID] = struct{}{}
+			}
+
+			for id := range streamIDSet {
+				streamIDs = append(streamIDs, id)
+			}
+		}
+
+		ti.objects = append(ti.objects, objectDescriptor{
+			path:      path,
+			tenant:    tr.Tenant,
+			streamIDs: streamIDs,
+			minTime:   tr.MinTime,
+			maxTime:   tr.MaxTime,
+		})
+	}
+
 	return []string{path}, nil
 }
 
@@ -374,7 +437,11 @@ func (ti *TestIngester) Metastore() *metastore.ObjectMetastore {
 func (ti *TestIngester) UploadedPaths() []string {
 	ti.mu.Lock()
 	defer ti.mu.Unlock()
-	return append([]string{}, ti.uploadedPaths...)
+	paths := make([]string, len(ti.objects))
+	for i, obj := range ti.objects {
+		paths[i] = obj.path
+	}
+	return paths
 }
 
 // Close cleans up resources.
@@ -396,27 +463,28 @@ func (ti *TestIngester) Cleanup(ctx context.Context) error {
 	ti.mu.Lock()
 	defer ti.mu.Unlock()
 
-	for _, path := range ti.uploadedPaths {
-		if err := ti.bucket.Delete(ctx, path); err != nil {
-			return fmt.Errorf("deleting %s: %w", path, err)
+	for _, obj := range ti.objects {
+		if err := ti.bucket.Delete(ctx, obj.path); err != nil {
+			return fmt.Errorf("deleting %s: %w", obj.path, err)
 		}
 	}
-	ti.uploadedPaths = nil
+	ti.objects = nil
 	return nil
 }
 
 // ============================================================================
-// TEST CATALOG - WRAPS OBJECT METASTORE FOR ENGINE V2
+// TEST CATALOG - SIMPLIFIED DIRECT CATALOG FOR LEARNING LAB
 // ============================================================================
 
-// TestCatalog wraps ObjectMetastore to implement physical.Catalog for testing.
+// TestCatalog provides a simplified catalog for the learning lab that directly
+// uses tracked object metadata instead of the full metastore/index infrastructure.
 type TestCatalog struct {
-	metastore *metastore.ObjectMetastore
+	testIngester *TestIngester
 }
 
-// NewTestCatalog creates a new TestCatalog wrapping the given metastore.
-func NewTestCatalog(ms *metastore.ObjectMetastore) *TestCatalog {
-	return &TestCatalog{metastore: ms}
+// NewTestCatalog creates a new TestCatalog.
+func NewTestCatalog(ingester *TestIngester) *TestCatalog {
+	return &TestCatalog{testIngester: ingester}
 }
 
 // ResolveShardDescriptors implements physical.Catalog.
@@ -428,50 +496,35 @@ func (c *TestCatalog) ResolveShardDescriptors(
 }
 
 // ResolveShardDescriptorsWithShard implements physical.Catalog.
+// This simplified implementation uses tracked object metadata.
 func (c *TestCatalog) ResolveShardDescriptorsWithShard(
 	selector physical.Expression,
 	predicates []physical.Expression,
 	shard physical.ShardInfo,
 	from, through time.Time,
 ) ([]physical.FilteredShardDescriptor, error) {
-	ctx := context.Background()
+	c.testIngester.mu.Lock()
+	defer c.testIngester.mu.Unlock()
 
-	// Convert physical.Expression to label matchers
-	matchers, err := expressionToMatchers(selector)
-	if err != nil {
-		return nil, fmt.Errorf("converting selector to matchers: %w", err)
-	}
-
-	// Convert predicates to matchers
-	var predicateMatchers []*labels.Matcher
-	for _, pred := range predicates {
-		pm, err := expressionToMatchers(pred)
-		if err != nil {
-			// Skip predicates that can't be converted
-			continue
-		}
-		predicateMatchers = append(predicateMatchers, pm...)
-	}
-
-	// Query metastore
-	sections, err := c.metastore.Sections(ctx, from, through, matchers, predicateMatchers)
-	if err != nil {
-		return nil, fmt.Errorf("querying metastore: %w", err)
-	}
-
-	// Convert to FilteredShardDescriptor
 	var result []physical.FilteredShardDescriptor
-	for i, sec := range sections {
+	for idx, obj := range c.testIngester.objects {
 		// Apply sharding
-		if shard.Of > 1 && i%int(shard.Of) != int(shard.Shard) {
+		if shard.Of > 1 && idx%int(shard.Of) != int(shard.Shard) {
 			continue
 		}
 
+		// Filter by time range
+		if obj.maxTime.Before(from) || obj.minTime.After(through) {
+			continue
+		}
+
+		// For simplicity in the learning lab, return all sections (section 0)
+		// A full implementation would parse the selector and filter streams
 		result = append(result, physical.FilteredShardDescriptor{
-			Location:  physical.DataObjLocation(sec.SectionKey.ObjectPath),
-			Streams:   sec.StreamIDs,
-			Sections:  []int{int(sec.SectionKey.SectionIdx)},
-			TimeRange: physical.TimeRange{Start: sec.Start, End: sec.End},
+			Location:  physical.DataObjLocation(obj.path),
+			Streams:   obj.streamIDs,
+			Sections:  []int{0}, // Simplified: always return section 0
+			TimeRange: physical.TimeRange{Start: obj.minTime, End: obj.maxTime},
 		})
 	}
 

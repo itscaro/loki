@@ -129,12 +129,12 @@ In tests, we use mockCatalog with predefined data.
 */
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/v3/pkg/dataobj/metastore"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/logical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/physical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/types"
@@ -186,11 +186,30 @@ func TestPhysicalPlanning(t *testing.T) {
 		   4. TOPK becomes TopK node
 		   5. Parallelize is inserted as optimization hint
 		*/
-		// First, create a logical plan
+		ctx := context.Background()
+
+		// Create test ingester with real data across multiple streams
+		ingester := setupTestIngesterWithData(t, ctx, "test-tenant", map[string][]string{
+			`{app="test", env="prod"}`: {
+				"log line from prod 1",
+				"log line from prod 2",
+			},
+			`{app="test", env="dev"}`: {
+				"log line from dev 1",
+				"log line from dev 2",
+			},
+		})
+		defer ingester.Close()
+
+		// Get real catalog from ingester
+		catalog := ingester.Catalog()
+
+		// Create logical plan
+		now := time.Now()
 		q := &mockQuery{
 			statement: `{app="test"}`,
-			start:     1000,
-			end:       2000,
+			start:     now.Add(-1 * time.Hour).Unix(),
+			end:       now.Add(1 * time.Hour).Unix(),
 			direction: logproto.BACKWARD,
 			limit:     100,
 		}
@@ -200,26 +219,7 @@ func TestPhysicalPlanning(t *testing.T) {
 
 		t.Logf("Logical Plan:\n%s", logicalPlan.String())
 
-		// Create mock catalog with test data objects
-		now := time.Now()
-		catalog := &mockCatalog{
-			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
-				{
-					SectionKey: metastore.SectionKey{ObjectPath: "tenant/obj1", SectionIdx: 0},
-					StreamIDs:  []int64{1, 2},
-					Start:      now,
-					End:        now.Add(time.Hour),
-				},
-				{
-					SectionKey: metastore.SectionKey{ObjectPath: "tenant/obj2", SectionIdx: 0},
-					StreamIDs:  []int64{3, 4},
-					Start:      now,
-					End:        now.Add(time.Hour),
-				},
-			},
-		}
-
-		// Build physical plan
+		// Build physical plan with REAL catalog
 		planner := physical.NewPlanner(
 			physical.NewContext(q.Start(), q.End()),
 			catalog,
@@ -241,6 +241,18 @@ func TestPhysicalPlanning(t *testing.T) {
 		require.NoError(t, err)
 
 		t.Logf("Physical Plan (after optimization):\n%s", physical.PrintAsTree(optimizedPlan))
+
+		// Verify the catalog resolved to real data objects
+		var targetCount int
+		err = optimizedPlan.DFSWalk(root, func(n physical.Node) error {
+			if scanSet, ok := n.(*physical.ScanSet); ok {
+				targetCount += len(scanSet.Targets)
+			}
+			return nil
+		}, dag.PreOrderWalk)
+		require.NoError(t, err)
+		require.Greater(t, targetCount, 0, "should have at least one scan target from real storage")
+		t.Logf("Found %d scan targets from real storage", targetCount)
 	})
 
 	t.Run("physical plan with filter pushdown", func(t *testing.T) {
@@ -271,28 +283,31 @@ func TestPhysicalPlanning(t *testing.T) {
 		   2. Fewer rows processed by operators
 		   3. Better cache utilization
 		*/
+		ctx := context.Background()
+
+		// Create test ingester with real data containing "error" lines
+		ingester := setupTestIngesterWithData(t, ctx, "test-tenant", map[string][]string{
+			`{app="test"}`: {
+				"error: connection failed",
+				"info: request processed",
+				"error: timeout occurred",
+			},
+		})
+		defer ingester.Close()
+
+		catalog := ingester.Catalog()
+
+		now := time.Now()
 		q := &mockQuery{
 			statement: `{app="test"} |= "error"`,
-			start:     1000,
-			end:       2000,
+			start:     now.Add(-1 * time.Hour).Unix(),
+			end:       now.Add(1 * time.Hour).Unix(),
 			direction: logproto.BACKWARD,
 			limit:     100,
 		}
 
 		logicalPlan, err := logical.BuildPlan(q)
 		require.NoError(t, err)
-
-		now := time.Now()
-		catalog := &mockCatalog{
-			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
-				{
-					SectionKey: metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
-					StreamIDs:  []int64{1},
-					Start:      now,
-					End:        now.Add(time.Hour),
-				},
-			},
-		}
 
 		planner := physical.NewPlanner(
 			physical.NewContext(q.Start(), q.End()),
@@ -352,10 +367,26 @@ func TestPhysicalPlanning(t *testing.T) {
 		   2. RangeAggregation: Count entries per time window (5 min)
 		   3. VectorAggregation: Sum counts grouped by level label
 		*/
+		ctx := context.Background()
+
+		// Create test ingester with real data across different levels
+		ingester := setupTestIngesterMultiStream(t, ctx, "test-tenant", []struct {
+			labels string
+			lines  []string
+		}{
+			{`{app="test", level="error"}`, []string{"error log 1", "error log 2"}},
+			{`{app="test", level="info"}`, []string{"info log 1", "info log 2", "info log 3"}},
+			{`{app="test", level="warn"}`, []string{"warn log 1"}},
+		})
+		defer ingester.Close()
+
+		catalog := ingester.Catalog()
+
+		now := time.Now()
 		q := &mockQuery{
 			statement: `sum by (level) (count_over_time({app="test"}[5m]))`,
-			start:     3600,
-			end:       7200,
+			start:     now.Add(-10 * time.Minute).Unix(),
+			end:       now.Add(10 * time.Minute).Unix(),
 			interval:  5 * time.Minute,
 		}
 
@@ -363,18 +394,6 @@ func TestPhysicalPlanning(t *testing.T) {
 		require.NoError(t, err)
 
 		t.Logf("Logical Plan:\n%s", logicalPlan.String())
-
-		now := time.Now()
-		catalog := &mockCatalog{
-			sectionDescriptors: []*metastore.DataobjSectionDescriptor{
-				{
-					SectionKey: metastore.SectionKey{ObjectPath: "obj1", SectionIdx: 0},
-					StreamIDs:  []int64{1, 2, 3},
-					Start:      now,
-					End:        now.Add(time.Hour),
-				},
-			},
-		}
 
 		planner := physical.NewPlanner(
 			physical.NewContext(q.Start(), q.End()),

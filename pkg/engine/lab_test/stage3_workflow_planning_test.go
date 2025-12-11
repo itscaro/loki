@@ -128,10 +128,12 @@ import (
 	"github.com/go-kit/log"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/loki/v3/pkg/engine/internal/planner/logical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/physical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/types"
 	"github.com/grafana/loki/v3/pkg/engine/internal/util/dag"
 	"github.com/grafana/loki/v3/pkg/engine/internal/workflow"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 // ============================================================================
@@ -245,28 +247,48 @@ func TestWorkflowPlanning_ParallelScans(t *testing.T) {
 
 		   This enables parallel data loading from storage.
 		*/
-		var graph dag.Graph[physical.Node]
+		ctx := context.Background()
 
-		scanSet := graph.Add(&physical.ScanSet{
-			Targets: []*physical.ScanTarget{
-				{Type: physical.ScanTypeDataObject, DataObject: &physical.DataObjScan{Location: "obj1", Section: 0}},
-				{Type: physical.ScanTypeDataObject, DataObject: &physical.DataObjScan{Location: "obj2", Section: 0}},
-				{Type: physical.ScanTypeDataObject, DataObject: &physical.DataObjScan{Location: "obj3", Section: 0}},
-			},
+		// Create test ingester with data across multiple streams (creates multiple sections)
+		ingester := setupTestIngesterMultiStream(t, ctx, "test-tenant", []struct {
+			labels string
+			lines  []string
+		}{
+			{`{app="test", stream="1"}`, []string{"stream 1 log 1", "stream 1 log 2"}},
+			{`{app="test", stream="2"}`, []string{"stream 2 log 1", "stream 2 log 2"}},
+			{`{app="test", stream="3"}`, []string{"stream 3 log 1", "stream 3 log 2"}},
 		})
-		parallelize := graph.Add(&physical.Parallelize{})
-		rangeAgg := graph.Add(&physical.RangeAggregation{
-			Operation: types.RangeAggregationTypeCount,
-		})
+		defer ingester.Close()
 
-		_ = graph.AddEdge(dag.Edge[physical.Node]{Parent: parallelize, Child: scanSet})
-		_ = graph.AddEdge(dag.Edge[physical.Node]{Parent: rangeAgg, Child: parallelize})
+		catalog := ingester.Catalog()
 
-		physicalPlan := physical.FromGraph(graph)
+		now := time.Now()
+		q := &mockQuery{
+			statement: `{app="test"}`,
+			start:     now.Add(-10 * time.Minute).Unix(),
+			end:       now.Add(10 * time.Minute).Unix(),
+			direction: logproto.BACKWARD,
+			limit:     100,
+		}
+
+		logicalPlan, err := logical.BuildPlan(q)
+		require.NoError(t, err)
+
+		// Build physical plan with real catalog
+		planner := physical.NewPlanner(
+			physical.NewContext(q.Start(), q.End()),
+			catalog,
+		)
+
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
 
 		runner := newTestRunner()
 
-		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, physicalPlan)
+		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, optimizedPlan)
 		require.NoError(t, err)
 
 		t.Logf("Workflow with parallel scans:\n%s", workflow.Sprint(wf))
@@ -282,12 +304,13 @@ func TestWorkflowPlanning_ParallelScans(t *testing.T) {
 		// Verify tasks were registered with runner
 		runner.mu.RLock()
 		numTasks := len(runner.tasks)
+		numStreams := len(runner.streams)
 		runner.mu.RUnlock()
 
-		// Should have multiple tasks:
-		// - 1 for range aggregation (root)
-		// - 3 for individual scan targets
+		// Should have multiple tasks created from real data objects
+		require.Greater(t, numTasks, 0, "should have at least one task from real storage")
 		t.Logf("Number of tasks registered: %d", numTasks)
+		t.Logf("Number of streams created: %d", numStreams)
 	})
 }
 
@@ -320,29 +343,47 @@ func TestWorkflowPlanning_StreamBindings(t *testing.T) {
 		   - Receiver task reads batches
 		   - Backpressure via blocking writes
 		*/
-		runner := newTestRunner()
+		ctx := context.Background()
 
-		// Build plan with multiple tasks
-		var graph dag.Graph[physical.Node]
-
-		scanSet := graph.Add(&physical.ScanSet{
-			Targets: []*physical.ScanTarget{
-				{Type: physical.ScanTypeDataObject, DataObject: &physical.DataObjScan{Location: "obj1"}},
-				{Type: physical.ScanTypeDataObject, DataObject: &physical.DataObjScan{Location: "obj2"}},
-			},
+		// Create test ingester with data in multiple streams
+		ingester := setupTestIngesterWithData(t, ctx, "test-tenant", map[string][]string{
+			`{app="test", region="us-east"}`: {"log 1", "log 2"},
+			`{app="test", region="us-west"}`: {"log 3", "log 4"},
 		})
-		parallelize := graph.Add(&physical.Parallelize{})
-		agg := graph.Add(&physical.RangeAggregation{Operation: types.RangeAggregationTypeCount})
+		defer ingester.Close()
 
-		_ = graph.AddEdge(dag.Edge[physical.Node]{Parent: parallelize, Child: scanSet})
-		_ = graph.AddEdge(dag.Edge[physical.Node]{Parent: agg, Child: parallelize})
+		catalog := ingester.Catalog()
 
-		physicalPlan := physical.FromGraph(graph)
+		now := time.Now()
+		q := &mockQuery{
+			statement: `{app="test"}`,
+			start:     now.Add(-10 * time.Minute).Unix(),
+			end:       now.Add(10 * time.Minute).Unix(),
+			direction: logproto.BACKWARD,
+			limit:     100,
+		}
 
-		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, physicalPlan)
+		logicalPlan, err := logical.BuildPlan(q)
 		require.NoError(t, err)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Build physical plan with real catalog
+		planner := physical.NewPlanner(
+			physical.NewContext(q.Start(), q.End()),
+			catalog,
+		)
+
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
+
+		runner := newTestRunner()
+
+		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, optimizedPlan)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
 		pipeline, err := wf.Run(ctx)
@@ -453,41 +494,80 @@ func TestWorkflowPlanning_AdmissionControl(t *testing.T) {
 		   - Tasks queue up waiting for slots
 		   - Prevents resource exhaustion
 		*/
-		runner := newTestRunner()
+		ctx := context.Background()
 
-		// Build plan with many scan targets
-		var graph dag.Graph[physical.Node]
-		targets := make([]*physical.ScanTarget, 10)
+		// Create test data with many streams to generate multiple scan tasks
+		streams := make([]struct {
+			labels string
+			lines  []string
+		}, 10)
 		for i := 0; i < 10; i++ {
-			targets[i] = &physical.ScanTarget{
-				Type:       physical.ScanTypeDataObject,
-				DataObject: &physical.DataObjScan{Location: physical.DataObjLocation(fmt.Sprintf("obj%d", i))},
+			streams[i] = struct {
+				labels string
+				lines  []string
+			}{
+				labels: fmt.Sprintf(`{app="test", shard="%d"}`, i),
+				lines:  []string{fmt.Sprintf("log from shard %d", i)},
 			}
 		}
 
-		scanSet := graph.Add(&physical.ScanSet{Targets: targets})
-		parallelize := graph.Add(&physical.Parallelize{})
-		agg := graph.Add(&physical.RangeAggregation{Operation: types.RangeAggregationTypeCount})
+		ingester := setupTestIngesterMultiStream(t, ctx, "test-tenant", streams)
+		defer ingester.Close()
 
-		_ = graph.AddEdge(dag.Edge[physical.Node]{Parent: parallelize, Child: scanSet})
+		catalog := ingester.Catalog()
 
-		physicalPlan := physical.FromGraph(graph)
+		// Build logical plan
+		now := time.Now()
+		q := &mockQuery{
+			statement: `{app="test"}`,
+			start:     now.Add(-1 * time.Hour).Unix(),
+			end:       now.Add(1 * time.Hour).Unix(),
+			direction: logproto.BACKWARD,
+			limit:     100,
+		}
 
-		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, physicalPlan)
+		logicalPlan, err := logical.BuildPlan(q)
 		require.NoError(t, err)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Build physical plan with real catalog
+		planner := physical.NewPlanner(
+			physical.NewContext(q.Start(), q.End()),
+			catalog,
+		)
+
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
+
+		runner := newTestRunner()
+
+		// Configure admission control with low limits to demonstrate throttling
+		wfOptions := workflow.Options{
+			MaxRunningScanTasks:  3, // Only 3 scans at a time
+			MaxRunningOtherTasks: 0, // Unlimited non-scan tasks
+		}
+
+		wf, err := workflow.New(wfOptions, log.NewNopLogger(), "test-tenant", runner, optimizedPlan)
+		require.NoError(t, err)
+
+		t.Logf("Workflow with admission control (max scans=%d):\n%s", wfOptions.MaxRunningScanTasks, workflow.Sprint(wf))
+
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
 		pipeline, err := wf.Run(ctx)
 		require.NoError(t, err)
 		defer pipeline.Close()
 
-		// Cancel the context to trigger cancellation
-		cancel()
+		// Verify tasks were created from real data
+		runner.mu.RLock()
+		numTasks := len(runner.tasks)
+		runner.mu.RUnlock()
 
-		// In a real scenario, this would trigger task cancellation
-		t.Log("Context cancelled - tasks would transition to cancelled state")
+		t.Logf("Number of tasks created from real storage: %d", numTasks)
+		t.Log("Admission control would limit concurrent execution to 3 scan tasks")
 	})
 }
 

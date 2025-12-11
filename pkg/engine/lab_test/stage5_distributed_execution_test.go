@@ -214,10 +214,12 @@ import (
 	"github.com/go-kit/log"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/loki/v3/pkg/engine/internal/planner/logical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/physical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/types"
 	"github.com/grafana/loki/v3/pkg/engine/internal/util/dag"
 	"github.com/grafana/loki/v3/pkg/engine/internal/workflow"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 /*
@@ -275,31 +277,49 @@ func TestDistributedExecution(t *testing.T) {
 
 		   ============================================================================
 		*/
+		ctx := context.Background()
+
+		// Create test ingester with real data
+		ingester := setupTestIngesterWithData(t, ctx, "test-tenant", map[string][]string{
+			`{app="test"}`: {"log 1", "log 2", "log 3"},
+		})
+		defer ingester.Close()
+
+		catalog := ingester.Catalog()
+
+		now := time.Now()
+		q := &mockQuery{
+			statement: `{app="test"}`,
+			start:     now.Add(-10 * time.Minute).Unix(),
+			end:       now.Add(10 * time.Minute).Unix(),
+			direction: logproto.BACKWARD,
+			limit:     100,
+		}
+
+		logicalPlan, err := logical.BuildPlan(q)
+		require.NoError(t, err)
+
+		// Build physical plan with real catalog
+		planner := physical.NewPlanner(
+			physical.NewContext(q.Start(), q.End()),
+			catalog,
+		)
+
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
+
 		// Create a mock runner that simulates scheduler behavior
 		runner := newTestRunner()
 
-		// Build a simple physical plan
-		var graph dag.Graph[physical.Node]
-
-		scan := graph.Add(&physical.DataObjScan{
-			Location:  "obj1",
-			Section:   0,
-			StreamIDs: []int64{1},
-		})
-		rangeAgg := graph.Add(&physical.RangeAggregation{
-			Operation: types.RangeAggregationTypeCount,
-		})
-
-		_ = graph.AddEdge(dag.Edge[physical.Node]{Parent: rangeAgg, Child: scan})
-
-		physicalPlan := physical.FromGraph(graph)
-
 		// Create workflow - this internally creates a Manifest and registers with runner
-		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, physicalPlan)
+		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, optimizedPlan)
 		require.NoError(t, err)
 
 		// Run workflow - this starts tasks
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
 		pipeline, err := wf.Run(ctx)
@@ -501,29 +521,47 @@ func TestStreamBindingsDistributed(t *testing.T) {
 
 		   ============================================================================
 		*/
-		runner := newTestRunner()
+		ctx := context.Background()
 
-		// Build plan with multiple scan targets (creates multiple tasks)
-		var graph dag.Graph[physical.Node]
-
-		scanSet := graph.Add(&physical.ScanSet{
-			Targets: []*physical.ScanTarget{
-				{Type: physical.ScanTypeDataObject, DataObject: &physical.DataObjScan{Location: "obj1"}},
-				{Type: physical.ScanTypeDataObject, DataObject: &physical.DataObjScan{Location: "obj2"}},
-			},
+		// Create test ingester with data in multiple streams
+		ingester := setupTestIngesterWithData(t, ctx, "test-tenant", map[string][]string{
+			`{app="test", stream="1"}`: {"stream 1 log 1", "stream 1 log 2"},
+			`{app="test", stream="2"}`: {"stream 2 log 1", "stream 2 log 2"},
 		})
-		parallelize := graph.Add(&physical.Parallelize{})
-		agg := graph.Add(&physical.RangeAggregation{Operation: types.RangeAggregationTypeCount})
+		defer ingester.Close()
 
-		_ = graph.AddEdge(dag.Edge[physical.Node]{Parent: parallelize, Child: scanSet})
-		_ = graph.AddEdge(dag.Edge[physical.Node]{Parent: agg, Child: parallelize})
+		catalog := ingester.Catalog()
 
-		physicalPlan := physical.FromGraph(graph)
+		now := time.Now()
+		q := &mockQuery{
+			statement: `{app="test"}`,
+			start:     now.Add(-10 * time.Minute).Unix(),
+			end:       now.Add(10 * time.Minute).Unix(),
+			direction: logproto.BACKWARD,
+			limit:     100,
+		}
 
-		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, physicalPlan)
+		logicalPlan, err := logical.BuildPlan(q)
 		require.NoError(t, err)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Build physical plan with real catalog
+		planner := physical.NewPlanner(
+			physical.NewContext(q.Start(), q.End()),
+			catalog,
+		)
+
+		physicalPlan, err := planner.Build(logicalPlan)
+		require.NoError(t, err)
+
+		optimizedPlan, err := planner.Optimize(physicalPlan)
+		require.NoError(t, err)
+
+		runner := newTestRunner()
+
+		wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, optimizedPlan)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
 		pipeline, err := wf.Run(ctx)

@@ -29,6 +29,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/user"
 	"github.com/oklog/ulid/v2"
 	"github.com/stretchr/testify/require"
 
@@ -479,4 +480,134 @@ func newTestWorkflow(t testingT, physicalPlan *physical.Plan) (*workflow.Workflo
 	wf, err := workflow.New(workflow.Options{}, log.NewNopLogger(), "test-tenant", runner, physicalPlan)
 	require.NoError(t, err)
 	return wf, runner
+}
+
+// ============================================================================
+// TEST INGESTER HELPERS
+// ============================================================================
+
+/*
+setupTestIngesterWithData creates a TestIngester with sample data for testing.
+
+This helper simplifies test setup by:
+1. Creating an in-memory test ingester
+2. Pushing the provided log data
+3. Flushing to create DataObj files
+4. Returning the ingester with its catalog
+
+Usage:
+
+	ingester := setupTestIngesterWithData(t, ctx, "tenant-1", map[string][]string{
+	    `{app="test", env="prod"}`: {
+	        "error: connection failed",
+	        "error: timeout occurred",
+	    },
+	    `{app="test", env="dev"}`: {
+	        "info: request completed",
+	    },
+	})
+	defer ingester.Close()
+
+	catalog := ingester.Catalog()
+	// Use catalog in physical planner...
+*/
+func setupTestIngesterWithData(t testingT, ctx context.Context, tenant string, data map[string][]string) *TestIngester {
+	ingester, err := InMemoryIngester()
+	require.NoError(t, err)
+
+	for labels, lines := range data {
+		err := ingester.PushSimple(ctx, tenant, labels, lines)
+		require.NoError(t, err)
+	}
+
+	_, err = ingester.Flush(ctx)
+	require.NoError(t, err)
+
+	return ingester
+}
+
+/*
+setupTestIngesterWithTimestamps creates a TestIngester with timestamped data.
+
+This helper allows specifying exact timestamps for each log entry, useful for
+testing time-based queries and aggregations.
+
+Usage:
+
+	entries := []LogEntry{
+	    {
+	        Labels:    `{app="test"}`,
+	        Line:      "error: connection failed",
+	        Timestamp: time.Unix(0, 1000000003),
+	    },
+	    {
+	        Labels:    `{app="test"}`,
+	        Line:      "error: timeout occurred",
+	        Timestamp: time.Unix(0, 1000000001),
+	    },
+	}
+	ingester := setupTestIngesterWithTimestamps(t, ctx, "tenant-1", entries)
+	defer ingester.Close()
+*/
+func setupTestIngesterWithTimestamps(t testingT, ctx context.Context, tenant string, entries []LogEntry) *TestIngester {
+	ingester, err := InMemoryIngester()
+	require.NoError(t, err)
+
+	err = ingester.Push(ctx, tenant, entries)
+	require.NoError(t, err)
+
+	_, err = ingester.Flush(ctx)
+	require.NoError(t, err)
+
+	return ingester
+}
+
+/*
+ctxWithTenant creates a context with the tenant ID injected.
+This is needed for executor operations that require tenant context.
+
+Usage:
+
+	execCtx := ctxWithTenant(ctx, "tenant-1")
+	pipeline := executor.Run(execCtx, cfg, plan, logger)
+*/
+func ctxWithTenant(ctx context.Context, tenant string) context.Context {
+	return user.InjectOrgID(ctx, tenant)
+}
+
+/*
+setupTestIngesterMultiStream creates a TestIngester with multiple streams.
+
+This helper creates data across multiple label combinations, useful for testing
+stream grouping, aggregations, and filtering.
+
+Usage:
+
+	streams := []struct {
+	    labels string
+	    lines  []string
+	}{
+	    {`{app="test", level="error"}`, []string{"error 1", "error 2"}},
+	    {`{app="test", level="info"}`, []string{"info 1", "info 2", "info 3"}},
+	    {`{app="other", level="error"}`, []string{"other error"}},
+	}
+	ingester := setupTestIngesterMultiStream(t, ctx, "tenant-1", streams)
+	defer ingester.Close()
+*/
+func setupTestIngesterMultiStream(t testingT, ctx context.Context, tenant string, streams []struct {
+	labels string
+	lines  []string
+}) *TestIngester {
+	ingester, err := InMemoryIngester()
+	require.NoError(t, err)
+
+	for _, stream := range streams {
+		err := ingester.PushSimple(ctx, tenant, stream.labels, stream.lines)
+		require.NoError(t, err)
+	}
+
+	_, err = ingester.Flush(ctx)
+	require.NoError(t, err)
+
+	return ingester
 }
