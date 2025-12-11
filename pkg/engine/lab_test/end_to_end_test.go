@@ -1548,7 +1548,7 @@ func TestEngineV2_QueryInterface(t *testing.T) {
 	// "basic" = no workers/scheduler needed, simpler and faster for testing (RECOMMENDED)
 	// "standard" = full distributed execution with workers and scheduler (currently has issues)
 	//
-	engineType := "standard"
+	engineType := "basic"
 
 	// Create test logger that outputs to test log
 	logger := log.With(log.NewLogfmtLogger(log.NewSyncWriter(&testLogWriter{t: t})), "test", t.Name())

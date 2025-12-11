@@ -80,10 +80,12 @@ import (
 	"github.com/grafana/loki/v3/pkg/dataobj/consumer/logsobj"
 	"github.com/grafana/loki/v3/pkg/dataobj/metastore"
 	"github.com/grafana/loki/v3/pkg/dataobj/sections/logs"
+	"github.com/grafana/loki/v3/pkg/dataobj/sections/streams"
 	"github.com/grafana/loki/v3/pkg/dataobj/uploader"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/physical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/types"
 	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
 	"github.com/grafana/loki/v3/pkg/scratch"
 )
 
@@ -180,6 +182,11 @@ type TestIngester struct {
 	// Track tenants that have been used
 	tenants map[string]struct{}
 
+	// Track stream labels for catalog filtering
+	// Maps: tenant -> labels string -> parsed labels
+	// We'll map actual stream IDs to labels after flushing
+	streamLabelMap map[string]map[string]labels.Labels
+
 	// Catalog for querying
 	metastore *metastore.ObjectMetastore
 	catalog   physical.Catalog
@@ -187,11 +194,12 @@ type TestIngester struct {
 
 // objectDescriptor tracks metadata about uploaded objects for the catalog
 type objectDescriptor struct {
-	path      string
-	tenant    string
-	streamIDs []int64
-	minTime   time.Time
-	maxTime   time.Time
+	path         string
+	tenant       string
+	streamIDs    []int64
+	streamLabels map[int64]labels.Labels // Map of stream ID to labels
+	minTime      time.Time
+	maxTime      time.Time
 }
 
 // NewTestIngester creates a new TestIngester.
@@ -246,14 +254,15 @@ func NewTestIngester(cfg TestIngesterConfig) (*TestIngester, error) {
 	ms := metastore.NewObjectMetastore(bucket, logger, nil)
 
 	ti := &TestIngester{
-		cfg:       cfg,
-		logger:    logger,
-		bucket:    bucket,
-		uploader:  up,
-		builder:   builder,
-		metastore: ms,
-		tenants:   make(map[string]struct{}),
-		objects:   make([]objectDescriptor, 0),
+		cfg:            cfg,
+		logger:         logger,
+		bucket:         bucket,
+		uploader:       up,
+		builder:        builder,
+		metastore:      ms,
+		tenants:        make(map[string]struct{}),
+		objects:        make([]objectDescriptor, 0),
+		streamLabelMap: make(map[string]map[string]labels.Labels),
 	}
 
 	// Create catalog that uses tracked object metadata
@@ -270,14 +279,28 @@ func (ti *TestIngester) Push(ctx context.Context, tenant string, entries []LogEn
 	// Track tenants for catalog queries
 	ti.tenants[tenant] = struct{}{}
 
+	// Initialize tenant map if needed
+	if ti.streamLabelMap[tenant] == nil {
+		ti.streamLabelMap[tenant] = make(map[string]labels.Labels)
+	}
+
 	// Group entries by labels (stream)
 	streamsByLabels := make(map[string][]LogEntry)
 	for _, entry := range entries {
 		streamsByLabels[entry.Labels] = append(streamsByLabels[entry.Labels], entry)
 	}
 
-	// Append each stream
+	// Append each stream and track labels
 	for labelsStr, streamEntries := range streamsByLabels {
+		// Parse and store labels for this stream
+		if _, exists := ti.streamLabelMap[tenant][labelsStr]; !exists {
+			lbls, err := syntax.ParseLabels(labelsStr)
+			if err != nil {
+				return fmt.Errorf("parsing labels %q: %w", labelsStr, err)
+			}
+			ti.streamLabelMap[tenant][labelsStr] = lbls
+		}
+
 		// Convert to logproto.Stream
 		protoEntries := make([]logproto.Entry, len(streamEntries))
 		for i, entry := range streamEntries {
@@ -376,10 +399,12 @@ func (ti *TestIngester) flush(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("uploading object: %w", err)
 	}
 
-	// Track object metadata for catalog (simplified approach for testing)
+	// Track object metadata for catalog
 	for _, tr := range timeRanges {
 		// Get stream IDs from the object
 		var streamIDs []int64
+		streamIDSet := make(map[int64]struct{})
+
 		for _, section := range obj.Sections().Filter(logs.CheckSection) {
 			if section.Tenant != tr.Tenant {
 				continue
@@ -391,7 +416,6 @@ func (ti *TestIngester) flush(ctx context.Context) ([]string, error) {
 			}
 
 			// Collect unique stream IDs
-			streamIDSet := make(map[int64]struct{})
 			iter := logs.IterSection(ctx, logsSection)
 			for rec := range iter {
 				val, err := rec.Value()
@@ -400,18 +424,52 @@ func (ti *TestIngester) flush(ctx context.Context) ([]string, error) {
 				}
 				streamIDSet[val.StreamID] = struct{}{}
 			}
+		}
 
-			for id := range streamIDSet {
-				streamIDs = append(streamIDs, id)
+		for id := range streamIDSet {
+			streamIDs = append(streamIDs, id)
+		}
+
+		// Build stream labels map by reading stream metadata from the DataObj
+		streamLabels := make(map[int64]labels.Labels)
+
+		// Open the DataObj and read stream metadata from the streams section
+		dataObj, err := dataobj.FromBucket(ctx, ti.bucket, path)
+		if err == nil {
+			// Look for the streams section which contains stream ID -> labels mapping
+			for _, section := range dataObj.Sections().Filter(streams.CheckSection) {
+				if section.Tenant != tr.Tenant {
+					continue
+				}
+
+				// Open the streams section
+				streamsSection, err := streams.Open(ctx, section)
+				if err != nil {
+					continue
+				}
+
+				// Read stream IDs and labels from the section
+				// The streams section has columns: stream_id, label (one per label name), etc.
+				iter := streams.IterSection(ctx, streamsSection)
+				for rec := range iter {
+					val, err := rec.Value()
+					if err != nil {
+						continue
+					}
+
+					// val contains the stream info including ID and labels
+					streamLabels[val.ID] = val.Labels
+				}
 			}
 		}
 
 		ti.objects = append(ti.objects, objectDescriptor{
-			path:      path,
-			tenant:    tr.Tenant,
-			streamIDs: streamIDs,
-			minTime:   tr.MinTime,
-			maxTime:   tr.MaxTime,
+			path:         path,
+			tenant:       tr.Tenant,
+			streamIDs:    streamIDs,
+			streamLabels: streamLabels,
+			minTime:      tr.MinTime,
+			maxTime:      tr.MaxTime,
 		})
 	}
 
@@ -496,7 +554,7 @@ func (c *TestCatalog) ResolveShardDescriptors(
 }
 
 // ResolveShardDescriptorsWithShard implements physical.Catalog.
-// This simplified implementation uses tracked object metadata.
+// This implementation filters streams based on the label selector.
 func (c *TestCatalog) ResolveShardDescriptorsWithShard(
 	selector physical.Expression,
 	predicates []physical.Expression,
@@ -505,6 +563,12 @@ func (c *TestCatalog) ResolveShardDescriptorsWithShard(
 ) ([]physical.FilteredShardDescriptor, error) {
 	c.testIngester.mu.Lock()
 	defer c.testIngester.mu.Unlock()
+
+	// Parse selector to get label matchers
+	matchers, err := expressionToMatchers(selector)
+	if err != nil {
+		return nil, fmt.Errorf("parsing selector: %w", err)
+	}
 
 	var result []physical.FilteredShardDescriptor
 	for idx, obj := range c.testIngester.objects {
@@ -518,17 +582,58 @@ func (c *TestCatalog) ResolveShardDescriptorsWithShard(
 			continue
 		}
 
-		// For simplicity in the learning lab, return all sections (section 0)
-		// A full implementation would parse the selector and filter streams
-		result = append(result, physical.FilteredShardDescriptor{
-			Location:  physical.DataObjLocation(obj.path),
-			Streams:   obj.streamIDs,
-			Sections:  []int{0}, // Simplified: always return section 0
-			TimeRange: physical.TimeRange{Start: obj.minTime, End: obj.maxTime},
-		})
+		// Filter streams by label selector
+		filteredStreamIDs, err := c.filterStreamsByLabels(obj.path, obj.streamIDs, matchers, obj.streamLabels)
+		if err != nil {
+			return nil, fmt.Errorf("filtering streams: %w", err)
+		}
+
+		// Only include if we have matching streams
+		if len(filteredStreamIDs) > 0 {
+			result = append(result, physical.FilteredShardDescriptor{
+				Location:  physical.DataObjLocation(obj.path),
+				Streams:   filteredStreamIDs,
+				Sections:  []int{0}, // Simplified: always return section 0
+				TimeRange: physical.TimeRange{Start: obj.minTime, End: obj.maxTime},
+			})
+		}
 	}
 
 	return result, nil
+}
+
+// filterStreamsByLabels filters stream IDs based on label matchers.
+// It uses the tracked stream labels from the object descriptor.
+func (c *TestCatalog) filterStreamsByLabels(objPath string, streamIDs []int64, matchers []*labels.Matcher, streamLabels map[int64]labels.Labels) ([]int64, error) {
+	if len(matchers) == 0 {
+		// No matchers means select all streams
+		return streamIDs, nil
+	}
+
+	// Filter stream IDs based on matchers
+	var filtered []int64
+	for _, streamID := range streamIDs {
+		lbls, exists := streamLabels[streamID]
+		if !exists {
+			// If we don't have labels for this stream, skip it
+			continue
+		}
+
+		// Check if all matchers match
+		allMatch := true
+		for _, matcher := range matchers {
+			if !matcher.Matches(lbls.Get(matcher.Name)) {
+				allMatch = false
+				break
+			}
+		}
+
+		if allMatch {
+			filtered = append(filtered, streamID)
+		}
+	}
+
+	return filtered, nil
 }
 
 // expressionToMatchers converts a physical.Expression to label matchers.

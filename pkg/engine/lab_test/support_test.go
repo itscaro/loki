@@ -1,27 +1,38 @@
 package engine_lab
 
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/go-kit/log"
+	"github.com/grafana/loki/v3/pkg/engine"
+	"github.com/grafana/loki/v3/pkg/engine/internal/executor"
+	"github.com/grafana/loki/v3/pkg/engine/internal/planner/logical"
+	"github.com/grafana/loki/v3/pkg/engine/internal/planner/physical"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/metadata"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/stretchr/testify/require"
+)
+
 /*
 ================================================================================
 ENGINE V2 FEATURE SUPPORT TEST
 ================================================================================
 
-This file provides a comprehensive table-driven test of all LogQL features
-to demonstrate which features are supported in Engine V2 and which are not.
+This file provides comprehensive tests of LogQL features supported in Engine V2.
+Each feature has its own subtest for easy individual execution.
 
-Each test case executes against REAL STORAGE using TestIngester and attempts
+Each test executes against REAL STORAGE using TestIngester and attempts
 the complete query flow: logical planning → physical planning → execution.
 
-TEST STRUCTURE:
----------------
-- `planSupported`: Whether logical planning should succeed
-- `expectExecError`: Whether execution should fail (for partial support cases)
-- `expectedRowCount`: Expected number of result rows (documents actual behavior)
-
-All features that have plan support ALWAYS get executed - no skipping!
-This allows us to:
-1. Verify actual engine behavior
-2. Track when features become fully supported
-3. Document expected results for future implementations
+All features that have plan support are FULLY EXECUTABLE - no partial support!
+If we can build a logical plan for it, we can execute it.
 
 Feature Categories Tested:
   - Stream Selectors
@@ -36,7 +47,7 @@ Feature Categories Tested:
 
 FULLY SUPPORTED (Logical → Physical → Execution):
 --------------------------------------------------
-✓ Stream selectors (=, !=, =~, !~) - NOTE: Label filtering has a bug, returns all logs
+✓ Stream selectors (=, !=, =~, !~) - Working correctly!
 ✓ Multiple label selectors (AND)
 ✓ Line filters (|=, !=, |~, !~) - Working correctly!
 ✓ Multiple line filters (chaining)
@@ -60,574 +71,827 @@ NOT SUPPORTED:
 ✗ Label replace
 ✗ avg, count aggregations
 
-KNOWN BUGS:
------------
-⚠ Label selectors don't filter properly - all logs are returned regardless
-  of label matchers. Line filters work correctly after this bug.
-  (Expected row counts reflect this bug for tracking purposes)
-
 ================================================================================
 */
 
-import (
-	"context"
-	"testing"
-	"time"
+// ============================================================================
+// HELPER METHODS
+// ============================================================================
 
-	"github.com/stretchr/testify/require"
+// testLogQuery executes a log query and returns the result streams
+func testLogQuery(t *testing.T, ctx context.Context, query string, testData []LogEntry) logqlmodel.Streams {
+	t.Helper()
 
-	"github.com/go-kit/log"
-	"github.com/grafana/loki/v3/pkg/engine/internal/executor"
-	"github.com/grafana/loki/v3/pkg/engine/internal/planner/logical"
-	"github.com/grafana/loki/v3/pkg/engine/internal/planner/physical"
-	"github.com/grafana/loki/v3/pkg/logproto"
-)
-
-/*
-TestLogQLFeatureSupport is a comprehensive table-driven test that verifies
-which LogQL features are supported in Engine V2.
-
-For each feature:
-- Supported: Executes successfully and returns results
-- Unsupported: Returns error (usually during logical planning)
-*/
-func TestLogQLFeatureSupport(t *testing.T) {
-	ctx := context.Background()
-
-	// Setup test data with various log types for comprehensive testing
-	ingester := setupTestIngesterWithTimestamps(t, ctx, "test-tenant", []LogEntry{
-		// Regular logs
-		{Labels: `{app="test", level="error"}`, Line: "error: connection failed", Timestamp: time.Now().Add(-5 * time.Minute)},
-		{Labels: `{app="test", level="info"}`, Line: "info: request completed", Timestamp: time.Now().Add(-4 * time.Minute)},
-		{Labels: `{app="test", level="warn"}`, Line: "warn: high latency", Timestamp: time.Now().Add(-3 * time.Minute)},
-
-		// JSON formatted logs
-		{Labels: `{app="json-app"}`, Line: `{"level":"error","msg":"timeout"}`, Timestamp: time.Now().Add(-2 * time.Minute)},
-		{Labels: `{app="json-app"}`, Line: `{"level":"info","msg":"success"}`, Timestamp: time.Now().Add(-1 * time.Minute)},
-
-		// Logfmt formatted logs
-		{Labels: `{app="logfmt-app"}`, Line: `level=error msg="connection refused"`, Timestamp: time.Now()},
-	})
+	ingester := setupTestIngesterWithTimestamps(t, ctx, "test-tenant", testData)
 	defer ingester.Close()
 
 	catalog := ingester.Catalog()
 	now := time.Now()
 
-	testCases := []struct {
-		name             string
-		query            string
-		planSupported    bool // True if logical planning should succeed
-		expectExecError  bool // True if execution should fail (planning-only support)
-		expectedRowCount int  // Expected number of rows (-1 to skip row count check, used for future reference on unsupported features)
-	}{
-		// ===================================================================
-		// STREAM SELECTORS - All Supported
-		// NOTE: Engine V2 currently has a bug where label selectors don't filter
-		// properly - all logs are returned regardless of label matchers.
-		// The expected counts reflect ACTUAL behavior, not ideal behavior.
-		// When label filtering is fixed, update these expected counts.
-		// ===================================================================
-		{
-			name:             "simple label selector",
-			query:            `{app="test"}`,
-			planSupported:    true,
-			expectedRowCount: 6, // BUG: returns all 6 logs, should be 3 (test app only)
-		},
-		{
-			name:             "multiple label selectors (AND)",
-			query:            `{app="test", level="error"}`,
-			planSupported:    true,
-			expectedRowCount: 6, // BUG: returns all 6 logs, should be 1 (test+error only)
-		},
-		{
-			name:             "regex label selector",
-			query:            `{app=~"test.*"}`,
-			planSupported:    true,
-			expectedRowCount: 6, // BUG: returns all 6 logs, should be 3 (test app only)
-		},
-		{
-			name:             "negative label selector",
-			query:            `{app="test", level!="debug"}`, // Negative matchers need at least one positive
-			planSupported:    true,
-			expectedRowCount: 6, // BUG: returns all 6 logs, should be 3 (test app, no debug level)
-		},
-		{
-			name:             "negative regex selector",
-			query:            `{app="test", level!~"debug|trace"}`,
-			planSupported:    true,
-			expectedRowCount: 6, // BUG: returns all 6 logs, should be 3 (test app, none match debug|trace)
-		},
-
-		// ===================================================================
-		// LINE FILTERS - All Supported
-		// NOTE: Line filters work correctly in Engine V2.
-		// However, since label selectors don't filter, the row counts
-		// reflect filtering ALL 6 logs, not just the label-matched subset.
-		// ===================================================================
-		{
-			name:             "line contains filter",
-			query:            `{app="test"} |= "error"`,
-			planSupported:    true,
-			expectedRowCount: 3, // 3 logs contain "error" (across all apps due to label bug)
-		},
-		{
-			name:             "line not contains filter",
-			query:            `{app="test"} != "debug"`,
-			planSupported:    true,
-			expectedRowCount: 6, // All 6 logs don't contain "debug"
-		},
-		{
-			name:             "line regex filter",
-			query:            `{app="test"} |~ "error|warn"`,
-			planSupported:    true,
-			expectedRowCount: 4, // 4 logs match error|warn (across all apps)
-		},
-		{
-			name:             "negative line regex filter",
-			query:            `{app="test"} !~ "debug|trace"`,
-			planSupported:    true,
-			expectedRowCount: 6, // All 6 logs don't match debug|trace
-		},
-
-		// ===================================================================
-		// PARSERS - Supported in Logical Planning
-		// ===================================================================
-		{
-			name:             "json parser",
-			query:            `{app="json-app"} | json`,
-			planSupported:    true,
-			expectedRowCount: 6, // BUG: returns all 6 logs due to label selector bug
-		},
-		{
-			name:             "json parser with label filter",
-			query:            `{app="json-app"} | json | level="error"`,
-			planSupported:    true,
-			expectedRowCount: 2, // 2 logs have level=error after json parsing (json error + logfmt error)
-		},
-		{
-			name:             "logfmt parser",
-			query:            `{app="logfmt-app"} | logfmt`,
-			planSupported:    true,
-			expectedRowCount: 6, // BUG: returns all 6 logs due to label selector bug
-		},
-		{
-			name:             "logfmt parser with label filter",
-			query:            `{app="logfmt-app"} | logfmt | level="error"`,
-			planSupported:    true,
-			expectedRowCount: 2, // 2 logs have level=error after logfmt parsing (json error + logfmt error)
-		},
-
-		// ===================================================================
-		// LABEL MANIPULATION
-		// ===================================================================
-		{
-			name:             "drop labels",
-			query:            `{app="test"} | drop app`,
-			planSupported:    true,
-			expectedRowCount: 6, // All 6 logs (label selector bug + drop doesn't filter)
-		},
-		{
-			name:             "keep labels - NOT SUPPORTED",
-			query:            `{app="test"} | keep level`,
-			planSupported:    false,
-			expectedRowCount: 6, // When implemented (with current label bug): all 6 logs
-		},
-		{
-			name:             "line_format - NOT SUPPORTED",
-			query:            `{app="test"} | line_format "{{.level}}: {{.msg}}"`,
-			planSupported:    false,
-			expectedRowCount: 6, // When implemented (with current label bug): all 6 logs with formatted line
-		},
-		{
-			name:             "label_format - NOT SUPPORTED",
-			query:            `{app="test"} | label_format new_label="{{.app}}"`,
-			planSupported:    false,
-			expectedRowCount: 6, // When implemented (with current label bug): all 6 logs with new label
-		},
-
-		// ===================================================================
-		// SPECIAL FILTERS
-		// ===================================================================
-		{
-			name:             "decolorize - NOT SUPPORTED",
-			query:            `{app="test"} | decolorize`,
-			planSupported:    false,
-			expectedRowCount: 6, // When implemented (with current label bug): all 6 logs with colors stripped
-		},
-
-		// ===================================================================
-		// QUERY DIRECTION
-		// ===================================================================
-		{
-			name:             "backward direction (default)",
-			query:            `{app="test"}`,
-			planSupported:    true,
-			expectedRowCount: 6, // All 6 logs due to label selector bug (should be 3)
-		},
-		// Note: FORWARD direction tested separately with query params
-
-		// ===================================================================
-		// METRIC QUERIES - NOT SUPPORTED (instant vector queries)
-		// ===================================================================
-		{
-			name:             "count_over_time - NOT SUPPORTED",
-			query:            `count_over_time({app="test"}[5m])`,
-			planSupported:    false, // Instant vector queries not supported
-			expectedRowCount: 1,     // When implemented: single metric value (count=3)
-		},
-		{
-			name:             "rate - NOT SUPPORTED",
-			query:            `rate({app="test"}[5m])`,
-			planSupported:    false,
-			expectedRowCount: 1, // When implemented: single metric value (rate)
-		},
-		{
-			name:             "bytes_over_time - NOT SUPPORTED",
-			query:            `bytes_over_time({app="test"}[5m])`,
-			planSupported:    false,
-			expectedRowCount: 1, // When implemented: single metric value (total bytes)
-		},
-		{
-			name:             "bytes_rate - NOT SUPPORTED",
-			query:            `bytes_rate({app="test"}[5m])`,
-			planSupported:    false,
-			expectedRowCount: 1, // When implemented: single metric value (bytes/sec)
-		},
-
-		// ===================================================================
-		// AGGREGATIONS - Most are fully supported now!
-		// ===================================================================
-		{
-			name:             "sum aggregation",
-			query:            `sum(count_over_time({app="test"}[5m]))`,
-			planSupported:    true,
-			expectedRowCount: 1, // Single aggregated value
-		},
-		{
-			name:             "sum by aggregation",
-			query:            `sum by (level) (count_over_time({app="test"}[5m]))`,
-			planSupported:    true,
-			expectedRowCount: 4, // 4 levels due to label bug: error, info, warn from test + empty from other apps
-		},
-		{
-			name:             "avg aggregation - NOT SUPPORTED",
-			query:            `avg(count_over_time({app="test"}[5m]))`,
-			planSupported:    false,
-			expectedRowCount: 1, // When implemented: single averaged value
-		},
-		{
-			name:             "min aggregation",
-			query:            `min(count_over_time({app="test"}[5m]))`,
-			planSupported:    true,
-			expectedRowCount: 1, // Minimum value
-		},
-		{
-			name:             "max aggregation",
-			query:            `max(count_over_time({app="test"}[5m]))`,
-			planSupported:    true,
-			expectedRowCount: 1, // Maximum value
-		},
-		{
-			name:             "count aggregation - NOT SUPPORTED",
-			query:            `count(count_over_time({app="test"}[5m]))`,
-			planSupported:    false,
-			expectedRowCount: 1, // When implemented: count of series
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Determine query parameters based on query type
-			var q *mockQuery
-
-			// Check if this is a metric query (contains aggregation function or _over_time)
-			isMetricQuery := len(tc.query) >= 3 && (tc.query[:3] == "sum" ||
-				tc.query[:3] == "avg" ||
-				tc.query[:3] == "min" ||
-				tc.query[:3] == "max") ||
-				len(tc.query) >= 5 && (tc.query[:5] == "count" ||
-					tc.query[:5] == "bytes") ||
-				len(tc.query) >= 4 && tc.query[:4] == "rate"
-
-			if isMetricQuery {
-				// Metric query - needs interval parameter
-				q = &mockQuery{
-					statement: tc.query,
-					start:     now.Add(-10 * time.Minute).Unix(),
-					end:       now.Unix(),
-					interval:  5 * time.Minute,
-				}
-			} else {
-				// Log query (default)
-				q = &mockQuery{
-					statement: tc.query,
-					start:     now.Add(-1 * time.Hour).Unix(),
-					end:       now.Add(1 * time.Hour).Unix(),
-					direction: logproto.BACKWARD,
-					limit:     100,
-				}
-			}
-
-			// STAGE 1: Logical Planning
-			logicalPlan, err := logical.BuildPlan(q)
-
-			if !tc.planSupported {
-				// Feature not supported - should fail at logical planning
-				require.Error(t, err, "expected error for unsupported feature")
-				t.Logf("✗ NOT SUPPORTED (planning failed): %v", err)
-				t.Logf("  Expected %d rows when implemented", tc.expectedRowCount)
-				return
-			}
-
-			// Feature should be supported for planning
-			require.NoError(t, err, "logical planning should succeed for plan-supported feature")
-			t.Logf("✓ Logical planning succeeded")
-
-			// STAGE 2: Physical Planning
-			planner := physical.NewPlanner(
-				physical.NewContext(q.Start(), q.End()),
-				catalog,
-			)
-
-			physicalPlan, err := planner.Build(logicalPlan)
-			require.NoError(t, err, "physical planning should succeed")
-
-			optimizedPlan, err := planner.Optimize(physicalPlan)
-			require.NoError(t, err, "optimization should succeed")
-			t.Logf("✓ Physical planning succeeded")
-
-			// STAGE 3: Execution (ALWAYS execute, never skip)
-			execCtx := ctxWithTenant(ctx, "test-tenant")
-			executorCfg := executor.Config{
-				BatchSize: 100,
-				Bucket:    ingester.Bucket(),
-			}
-
-			pipeline := executor.Run(execCtx, executorCfg, optimizedPlan, log.NewNopLogger())
-			defer pipeline.Close()
-
-			// Read all results
-			var totalRows int64
-			var records []any // Keep track for proper cleanup
-			for {
-				rec, readErr := pipeline.Read(execCtx)
-				if readErr == executor.EOF {
-					break
-				}
-
-				if tc.expectExecError {
-					// Feature should fail during execution
-					if readErr != nil {
-						t.Logf("⊙ PARTIAL SUPPORT: Execution failed as expected: %v", readErr)
-						t.Logf("  Expected %d rows when fully implemented", tc.expectedRowCount)
-						return
-					}
-				} else {
-					// Fully supported feature should not error
-					require.NoError(t, readErr, "execution should succeed for fully supported feature")
-				}
-
-				if rec != nil {
-					totalRows += rec.NumRows()
-					records = append(records, rec)
-				}
-			}
-
-			// Clean up all records
-			for _, r := range records {
-				if rec, ok := r.(interface{ Release() }); ok {
-					rec.Release()
-				}
-			}
-
-			if tc.expectExecError {
-				// Partial support: execution didn't error, check if we got empty results
-				if totalRows == 0 {
-					t.Logf("⊙ PARTIAL SUPPORT: Execution returned no data")
-					t.Logf("  Expected %d rows when fully implemented", tc.expectedRowCount)
-					return
-				}
-				// Got data when we expected an error - feature may be more supported than documented
-				t.Logf("⊙ PARTIAL SUPPORT: Execution succeeded unexpectedly with %d rows (feature may be more supported than documented)", totalRows)
-				t.Logf("  Expected %d rows", tc.expectedRowCount)
-				// Still verify the count if we got data
-				if tc.expectedRowCount >= 0 {
-					require.Equal(t, int64(tc.expectedRowCount), totalRows, "unexpected row count for partially supported feature")
-				}
-				return
-			}
-
-			// Fully supported feature - verify results
-			t.Logf("✓ Execution succeeded - read %d rows", totalRows)
-
-			if tc.expectedRowCount >= 0 {
-				require.Equal(t, int64(tc.expectedRowCount), totalRows, "row count mismatch")
-				t.Logf("✓ Result verification passed: got expected %d rows", tc.expectedRowCount)
-			}
-		})
-	}
-}
-
-/*
-TestForwardDirectionNotSupported specifically tests that FORWARD direction
-queries are not yet supported.
-*/
-func TestForwardDirectionNotSupported(t *testing.T) {
-	ctx := context.Background()
-
-	ingester := setupTestIngesterWithData(t, ctx, "test-tenant", map[string][]string{
-		`{app="test"}`: {"log 1", "log 2", "log 3"},
-	})
-	defer ingester.Close()
-
-	now := time.Now()
 	q := &mockQuery{
-		statement: `{app="test"}`,
+		statement: query,
 		start:     now.Add(-1 * time.Hour).Unix(),
 		end:       now.Add(1 * time.Hour).Unix(),
-		direction: logproto.FORWARD, // FORWARD not supported
+		direction: logproto.BACKWARD,
 		limit:     100,
 	}
 
-	_, err := logical.BuildPlan(q)
-	require.Error(t, err, "FORWARD direction should not be supported")
-	require.Contains(t, err.Error(), "forward")
-	t.Logf("✗ FORWARD direction correctly rejected: %v", err)
+	// Logical planning
+	logicalPlan, err := logical.BuildPlan(q)
+	require.NoError(t, err, "logical planning should succeed")
+	t.Logf("✓ Logical planning succeeded")
+
+	// Physical planning
+	planner := physical.NewPlanner(
+		physical.NewContext(q.Start(), q.End()),
+		catalog,
+	)
+
+	physicalPlan, err := planner.Build(logicalPlan)
+	require.NoError(t, err, "physical planning should succeed")
+
+	optimizedPlan, err := planner.Optimize(physicalPlan)
+	require.NoError(t, err, "optimization should succeed")
+	t.Logf("✓ Physical planning succeeded")
+
+	// Execution
+	execCtx := ctxWithTenant(ctx, "test-tenant")
+	executorCfg := executor.Config{
+		BatchSize: 100,
+		Bucket:    ingester.Bucket(),
+	}
+
+	pipeline := executor.Run(execCtx, executorCfg, optimizedPlan, log.NewNopLogger())
+	defer pipeline.Close()
+
+	// Build result using the production streamResultBuilder
+	builder := engine.NewStreamsResultBuilder(logproto.BACKWARD, false)
+
+	for {
+		rec, readErr := pipeline.Read(execCtx)
+		if errors.Is(readErr, executor.EOF) {
+			break
+		}
+		require.NoError(t, readErr, "execution should succeed")
+
+		if rec != nil {
+			builder.CollectRecord(rec)
+			rec.Release()
+		}
+	}
+
+	t.Logf("✓ Execution succeeded")
+
+	// Build the logqlmodel.Result and extract streams
+	metaCtx, _ := metadata.NewContext(context.Background())
+	result := builder.Build(stats.Result{}, metaCtx)
+	streams, ok := result.Data.(logqlmodel.Streams)
+	require.True(t, ok, "result data should be logqlmodel.Streams, got %T", result.Data)
+
+	// Print results
+	t.Logf("\n=== QUERY RESULTS ===")
+	t.Logf("Query: %s", query)
+	t.Logf("Streams: %d", len(streams))
+	for i, stream := range streams {
+		t.Logf("  Stream %d: %s (%d entries)", i, stream.Labels, len(stream.Entries))
+		for j, entry := range stream.Entries {
+			if j < 5 { // Limit to first 5 entries per stream
+				t.Logf("    [%s] %s", entry.Timestamp.Format("15:04:05.000"), entry.Line)
+			}
+		}
+		if len(stream.Entries) > 5 {
+			t.Logf("    ... and %d more entries", len(stream.Entries)-5)
+		}
+	}
+
+	return streams
 }
 
-/*
-TestComplexQueriesSupport tests more complex query combinations.
-*/
-func TestComplexQueriesSupport(t *testing.T) {
-	ctx := context.Background()
+// testMetricQuery executes a metric query and returns the result vector
+func testMetricQuery(t *testing.T, ctx context.Context, query string, testData []LogEntry) promql.Vector {
+	t.Helper()
 
-	// Create rich test data
-	ingester := setupTestIngesterWithTimestamps(t, ctx, "test-tenant", []LogEntry{
-		{Labels: `{app="test", env="prod"}`, Line: `{"level":"error","latency_ms":250}`, Timestamp: time.Now().Add(-10 * time.Minute)},
-		{Labels: `{app="test", env="prod"}`, Line: `{"level":"info","latency_ms":50}`, Timestamp: time.Now().Add(-9 * time.Minute)},
-		{Labels: `{app="test", env="dev"}`, Line: `{"level":"error","latency_ms":100}`, Timestamp: time.Now().Add(-8 * time.Minute)},
-		{Labels: `{app="other", env="prod"}`, Line: `level=warn msg="slow query"`, Timestamp: time.Now().Add(-7 * time.Minute)},
-	})
+	ingester := setupTestIngesterWithTimestamps(t, ctx, "test-tenant", testData)
 	defer ingester.Close()
 
 	catalog := ingester.Catalog()
 	now := time.Now()
 
-	complexTests := []struct {
-		name             string
-		query            string
-		planSupported    bool
-		expectExecError  bool
-		expectedRowCount int
-	}{
-		{
-			name:             "multiple line filters",
-			query:            `{app="test"} |= "error" |= "connection"`,
-			planSupported:    true,
-			expectedRowCount: 0, // No logs contain both "error" AND "connection" (test data uses JSON format)
-		},
-		{
-			name:             "line filter + json parsing + label filter",
-			query:            `{app="test"} |= "level" | json | level="error"`,
-			planSupported:    true,
-			expectedRowCount: 2, // 2 JSON logs have level="error" after parsing (test data has JSON logs)
-		},
-		{
-			name:             "regex selector + line filter + drop",
-			query:            `{app=~"test.*"} |= "error" | drop env`,
-			planSupported:    true,
-			expectedRowCount: 2, // 2 logs contain "error" (due to label selector bug, all logs processed)
-		},
+	q := &mockQuery{
+		statement: query,
+		start:     now.Add(-10 * time.Minute).Unix(),
+		end:       now.Unix(),
+		interval:  5 * time.Minute,
 	}
 
-	for _, tc := range complexTests {
-		t.Run(tc.name, func(t *testing.T) {
-			q := &mockQuery{
-				statement: tc.query,
-				start:     now.Add(-1 * time.Hour).Unix(),
-				end:       now.Add(1 * time.Hour).Unix(),
-				direction: logproto.BACKWARD,
-				limit:     100,
+	// Logical planning
+	logicalPlan, err := logical.BuildPlan(q)
+	require.NoError(t, err, "logical planning should succeed")
+	t.Logf("✓ Logical planning succeeded")
+
+	// Physical planning
+	planner := physical.NewPlanner(
+		physical.NewContext(q.Start(), q.End()),
+		catalog,
+	)
+
+	physicalPlan, err := planner.Build(logicalPlan)
+	require.NoError(t, err, "physical planning should succeed")
+
+	optimizedPlan, err := planner.Optimize(physicalPlan)
+	require.NoError(t, err, "optimization should succeed")
+	t.Logf("✓ Physical planning succeeded")
+
+	// Execution
+	execCtx := ctxWithTenant(ctx, "test-tenant")
+	executorCfg := executor.Config{
+		BatchSize: 100,
+		Bucket:    ingester.Bucket(),
+	}
+
+	pipeline := executor.Run(execCtx, executorCfg, optimizedPlan, log.NewNopLogger())
+	defer pipeline.Close()
+
+	// Build result using the production vectorResultBuilder
+	builder := engine.NewVectorResultBuilder()
+
+	for {
+		rec, readErr := pipeline.Read(execCtx)
+		if errors.Is(readErr, executor.EOF) {
+			break
+		}
+		require.NoError(t, readErr, "execution should succeed")
+
+		if rec != nil {
+			builder.CollectRecord(rec)
+			rec.Release()
+		}
+	}
+
+	t.Logf("✓ Execution succeeded")
+
+	// Build the logqlmodel.Result and extract vector
+	metaCtx, _ := metadata.NewContext(context.Background())
+	result := builder.Build(stats.Result{}, metaCtx)
+	vector, ok := result.Data.(promql.Vector)
+	require.True(t, ok, "result data should be promql.Vector, got %T", result.Data)
+
+	// Print results
+	t.Logf("\n=== QUERY RESULTS ===")
+	t.Logf("Query: %s", query)
+	t.Logf("Vector samples: %d", len(vector))
+	for i, sample := range vector {
+		t.Logf("  Sample %d: %s = %v (t=%d)", i, sample.Metric.String(), sample.F, sample.T)
+	}
+
+	return vector
+}
+
+// testUnsupportedQuery verifies that a query fails at logical planning
+func testUnsupportedQuery(t *testing.T, ctx context.Context, query string, testData []LogEntry) {
+	t.Helper()
+
+	ingester := setupTestIngesterWithTimestamps(t, ctx, "test-tenant", testData)
+	defer ingester.Close()
+
+	now := time.Now()
+
+	// Determine if metric or log query
+	isMetricQuery := len(query) >= 3 && (query[:3] == "sum" ||
+		query[:3] == "avg" ||
+		query[:3] == "min" ||
+		query[:3] == "max") ||
+		len(query) >= 5 && (query[:5] == "count" ||
+			query[:5] == "bytes") ||
+		len(query) >= 4 && query[:4] == "rate"
+
+	var q *mockQuery
+	if isMetricQuery {
+		q = &mockQuery{
+			statement: query,
+			start:     now.Add(-10 * time.Minute).Unix(),
+			end:       now.Unix(),
+			interval:  5 * time.Minute,
+		}
+	} else {
+		q = &mockQuery{
+			statement: query,
+			start:     now.Add(-1 * time.Hour).Unix(),
+			end:       now.Add(1 * time.Hour).Unix(),
+			direction: logproto.BACKWARD,
+			limit:     100,
+		}
+	}
+
+	_, err := logical.BuildPlan(q)
+	require.Error(t, err, "expected error for unsupported feature")
+	t.Logf("✗ NOT SUPPORTED (planning failed): %v", err)
+}
+
+// assertStreamsEqual compares two stream results
+func assertStreamsEqual(t *testing.T, expected, actual logqlmodel.Streams) {
+	t.Helper()
+
+	require.Equal(t, len(expected), len(actual), "stream count mismatch")
+
+	for i := range expected {
+		require.Equal(t, expected[i].Labels, actual[i].Labels, "stream %d labels mismatch", i)
+		require.Equal(t, len(expected[i].Entries), len(actual[i].Entries), "stream %d entry count mismatch", i)
+
+		for j := range expected[i].Entries {
+			require.Equal(t, expected[i].Entries[j].Line, actual[i].Entries[j].Line,
+				"stream %d entry %d line mismatch", i, j)
+			// Note: We don't compare timestamps exactly as they may vary slightly
+		}
+	}
+}
+
+// assertVectorEqual compares two vector results (ignoring timestamps)
+func assertVectorEqual(t *testing.T, expected, actual promql.Vector) {
+	t.Helper()
+
+	require.Equal(t, len(expected), len(actual), "vector length mismatch")
+
+	// Sort both vectors by labels for consistent comparison
+	expectedSorted := make(promql.Vector, len(expected))
+	copy(expectedSorted, expected)
+	actualSorted := make(promql.Vector, len(actual))
+	copy(actualSorted, actual)
+
+	for i := range expectedSorted {
+		found := false
+		for j := range actualSorted {
+			if labels.Equal(expectedSorted[i].Metric, actualSorted[j].Metric) {
+				require.InDelta(t, expectedSorted[i].F, actualSorted[j].F, 0.001,
+					"value mismatch for metric %s", expectedSorted[i].Metric.String())
+				found = true
+				break
 			}
+		}
+		require.True(t, found, "expected metric %s not found in result", expectedSorted[i].Metric.String())
+	}
+}
 
-			logicalPlan, err := logical.BuildPlan(q)
+// ============================================================================
+// STREAM SELECTOR TESTS
+// ============================================================================
 
-			if !tc.planSupported {
-				require.Error(t, err)
-				t.Logf("✗ NOT SUPPORTED (planning failed): %v", err)
-				t.Logf("  Expected %d rows when implemented", tc.expectedRowCount)
-				return
+func TestStreamSelectors(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	t.Run("simple_label_selector", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "log 1", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "log 2", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="other"}`, Line: "log 3", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test"}`, testData)
+
+		// Label selector works correctly - returns only matching streams
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs with app=test")
+		require.Equal(t, 1, len(streams), "should have 1 stream")
+		require.Equal(t, `{app="test"}`, streams[0].Labels, "stream should have app=test label")
+		t.Logf("✓ Label selector works correctly: got %d entries in %d stream", totalEntries, len(streams))
+	})
+
+	t.Run("multiple_label_selectors", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", level="error"}`, Line: "error log", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test", level="info"}`, Line: "info log", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="other", level="error"}`, Line: "other error", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test", level="error"}`, testData)
+
+		// Multiple label selectors work correctly
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 1, totalEntries, "should return 1 log with app=test AND level=error")
+		require.Equal(t, 1, len(streams), "should have 1 stream")
+		t.Logf("✓ Multiple label selectors work correctly: got %d entry in %d stream", totalEntries, len(streams))
+	})
+
+	t.Run("regex_label_selector", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test-1"}`, Line: "log 1", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test-2"}`, Line: "log 2", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="other"}`, Line: "log 3", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app=~"test.*"}`, testData)
+
+		// Regex label selector works correctly
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs matching test.*")
+		require.Equal(t, 2, len(streams), "should have 2 streams")
+		t.Logf("✓ Regex label selector works correctly: got %d entries in %d streams", totalEntries, len(streams))
+	})
+
+	t.Run("negative_label_selector", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", level="error"}`, Line: "error", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test", level="debug"}`, Line: "debug", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="other", level="info"}`, Line: "info", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test", level!="debug"}`, testData)
+
+		// Negative label selector works correctly
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 1, totalEntries, "should return 1 log with app=test AND level!=debug")
+		require.Equal(t, 1, len(streams), "should have 1 stream")
+		t.Logf("✓ Negative label selector works correctly: got %d entry in %d stream", totalEntries, len(streams))
+	})
+
+	t.Run("negative_regex_selector", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", level="error"}`, Line: "error", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test", level="debug"}`, Line: "debug", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test", level="trace"}`, Line: "trace", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test", level!~"debug|trace"}`, testData)
+
+		// Negative regex selector works correctly
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 1, totalEntries, "should return 1 log with level=error (not debug or trace)")
+		require.Equal(t, 1, len(streams), "should have 1 stream")
+		t.Logf("✓ Negative regex selector works correctly: got %d entry in %d stream", totalEntries, len(streams))
+	})
+}
+
+// ============================================================================
+// LINE FILTER TESTS
+// ============================================================================
+
+func TestLineFilters(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	t.Run("line_contains_filter", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "error: connection failed", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "info: request completed", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "error: timeout", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test"} |= "error"`, testData)
+
+		// Line filter works correctly! Label selector filters to app="test" first, then line filter
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs containing 'error'")
+
+		// Verify content
+		for _, stream := range streams {
+			for _, entry := range stream.Entries {
+				require.Contains(t, entry.Line, "error", "all entries should contain 'error'")
 			}
+		}
+		t.Logf("✓ Line filter works correctly: got %d entries containing 'error'", totalEntries)
+	})
 
-			require.NoError(t, err)
-			t.Logf("✓ Logical planning succeeded")
+	t.Run("line_not_contains_filter", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "info log", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "debug log", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "error log", Timestamp: now.Add(-1 * time.Minute)},
+		}
 
-			planner := physical.NewPlanner(
-				physical.NewContext(q.Start(), q.End()),
-				catalog,
-			)
+		streams := testLogQuery(t, ctx, `{app="test"} != "debug"`, testData)
 
-			physicalPlan, err := planner.Build(logicalPlan)
-			require.NoError(t, err)
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs not containing 'debug'")
 
-			optimizedPlan, err := planner.Optimize(physicalPlan)
-			require.NoError(t, err)
-			t.Logf("✓ Physical planning succeeded")
-
-			// ALWAYS execute, never skip
-			execCtx := ctxWithTenant(ctx, "test-tenant")
-			executorCfg := executor.Config{
-				BatchSize: 100,
-				Bucket:    ingester.Bucket(),
+		// Verify content
+		for _, stream := range streams {
+			for _, entry := range stream.Entries {
+				require.NotContains(t, entry.Line, "debug", "no entries should contain 'debug'")
 			}
+		}
+		t.Logf("✓ Line filter works correctly: got %d entries not containing 'debug'", totalEntries)
+	})
 
-			pipeline := executor.Run(execCtx, executorCfg, optimizedPlan, log.NewNopLogger())
-			defer pipeline.Close()
+	t.Run("line_regex_filter", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "error occurred", Timestamp: now.Add(-4 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "warn: high latency", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "info: success", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "debug: trace", Timestamp: now.Add(-1 * time.Minute)},
+		}
 
-			// Read all results
-			var totalRows int64
-			var records []any
-			for {
-				rec, readErr := pipeline.Read(execCtx)
-				if readErr == executor.EOF {
-					break
-				}
+		streams := testLogQuery(t, ctx, `{app="test"} |~ "error|warn"`, testData)
 
-				if tc.expectExecError {
-					if readErr != nil {
-						t.Logf("⊙ PARTIAL SUPPORT: Execution failed as expected: %v", readErr)
-						t.Logf("  Expected %d rows when fully implemented", tc.expectedRowCount)
-						return
-					}
-				} else {
-					require.NoError(t, readErr, "execution should succeed")
-				}
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs matching 'error|warn'")
+		t.Logf("✓ Line regex filter works correctly: got %d entries", totalEntries)
+	})
 
-				if rec != nil {
-					totalRows += rec.NumRows()
-					records = append(records, rec)
-				}
+	t.Run("negative_line_regex_filter", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "info log", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "debug log", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "trace log", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test"} !~ "debug|trace"`, testData)
+
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 1, totalEntries, "should return 1 log not matching 'debug|trace'")
+		t.Logf("✓ Negative line regex filter works correctly: got %d entry", totalEntries)
+	})
+}
+
+// ============================================================================
+// PARSER TESTS
+// ============================================================================
+
+func TestParsers(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	t.Run("json_parser", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="json-app"}`, Line: `{"level":"error","msg":"timeout"}`, Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="json-app"}`, Line: `{"level":"info","msg":"success"}`, Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="json-app"} | json`, testData)
+
+		// BUG: Returns all 2 logs due to label selector bug
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs")
+		t.Logf("✓ JSON parser works: got %d entries", totalEntries)
+	})
+
+	t.Run("json_parser_with_label_filter", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="json-app"}`, Line: `{"level":"error","msg":"timeout"}`, Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="json-app"}`, Line: `{"level":"info","msg":"success"}`, Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="json-app"}`, Line: `{"level":"error","msg":"failed"}`, Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="json-app"} | json | level="error"`, testData)
+
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs with level=error after parsing")
+		t.Logf("✓ JSON parser with label filter works: got %d entries", totalEntries)
+	})
+
+	t.Run("logfmt_parser", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="logfmt-app"}`, Line: `level=error msg="connection refused"`, Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="logfmt-app"}`, Line: `level=info msg="request ok"`, Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="logfmt-app"} | logfmt`, testData)
+
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs")
+		t.Logf("✓ Logfmt parser works: got %d entries", totalEntries)
+	})
+
+	t.Run("logfmt_parser_with_label_filter", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="logfmt-app"}`, Line: `level=error msg="connection refused"`, Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="logfmt-app"}`, Line: `level=info msg="request ok"`, Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="logfmt-app"}`, Line: `level=error msg="timeout"`, Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="logfmt-app"} | logfmt | level="error"`, testData)
+
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs with level=error after parsing")
+		t.Logf("✓ Logfmt parser with label filter works: got %d entries", totalEntries)
+	})
+}
+
+// ============================================================================
+// LABEL MANIPULATION TESTS
+// ============================================================================
+
+func TestLabelManipulation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	t.Run("drop_labels", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", env="prod"}`, Line: "log 1", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test", env="dev"}`, Line: "log 2", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test"} | drop app`, testData)
+
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs (drop doesn't filter)")
+		t.Logf("✓ Drop labels works: got %d entries", totalEntries)
+	})
+
+	t.Run("keep_labels_not_supported", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", level="info"}`, Line: "log", Timestamp: now},
+		}
+
+		testUnsupportedQuery(t, ctx, `{app="test"} | keep level`, testData)
+	})
+
+	t.Run("line_format_not_supported", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "log", Timestamp: now},
+		}
+
+		testUnsupportedQuery(t, ctx, `{app="test"} | line_format "{{.level}}: {{.msg}}"`, testData)
+	})
+
+	t.Run("label_format_not_supported", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "log", Timestamp: now},
+		}
+
+		testUnsupportedQuery(t, ctx, `{app="test"} | label_format new_label="{{.app}}"`, testData)
+	})
+
+	t.Run("decolorize_not_supported", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "\x1b[31merror\x1b[0m", Timestamp: now},
+		}
+
+		testUnsupportedQuery(t, ctx, `{app="test"} | decolorize`, testData)
+	})
+}
+
+// ============================================================================
+// AGGREGATION TESTS
+// ============================================================================
+
+func TestAggregations(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	t.Run("sum_aggregation", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", level="error"}`, Line: "log 1", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test", level="info"}`, Line: "log 2", Timestamp: now.Add(-2 * time.Minute)},
+		}
+
+		vector := testMetricQuery(t, ctx, `sum(count_over_time({app="test"}[5m]))`, testData)
+
+		require.Equal(t, 1, len(vector), "should return single aggregated value")
+		require.Greater(t, vector[0].F, 0.0, "sum should be greater than 0")
+		t.Logf("✓ Sum aggregation works: value=%v", vector[0].F)
+	})
+
+	t.Run("sum_by_aggregation", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", level="error"}`, Line: "log 1", Timestamp: now.Add(-4 * time.Minute)},
+			{Labels: `{app="test", level="error"}`, Line: "log 2", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test", level="info"}`, Line: "log 3", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test", level="warn"}`, Line: "log 4", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		vector := testMetricQuery(t, ctx, `sum by (level) (count_over_time({app="test"}[5m]))`, testData)
+
+		require.Equal(t, 3, len(vector), "should return 3 levels")
+
+		// Verify we have the expected labels
+		labelSets := make(map[string]float64)
+		for _, sample := range vector {
+			level := sample.Metric.Get("level")
+			labelSets[level] = sample.F
+		}
+
+		require.Contains(t, labelSets, "error", "should have error level")
+		require.Contains(t, labelSets, "info", "should have info level")
+		require.Contains(t, labelSets, "warn", "should have warn level")
+
+		t.Logf("✓ Sum by aggregation works: %d series", len(vector))
+		for level, value := range labelSets {
+			t.Logf("  level=%s: count=%v", level, value)
+		}
+	})
+
+	t.Run("min_aggregation", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", stream="1"}`, Line: "log 1", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test", stream="2"}`, Line: "log 2", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		vector := testMetricQuery(t, ctx, `min(count_over_time({app="test"}[5m]))`, testData)
+
+		require.Equal(t, 1, len(vector), "should return single min value")
+		t.Logf("✓ Min aggregation works: value=%v", vector[0].F)
+	})
+
+	t.Run("max_aggregation", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", stream="1"}`, Line: "log 1", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test", stream="2"}`, Line: "log 2", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		vector := testMetricQuery(t, ctx, `max(count_over_time({app="test"}[5m]))`, testData)
+
+		require.Equal(t, 1, len(vector), "should return single max value")
+		t.Logf("✓ Max aggregation works: value=%v", vector[0].F)
+	})
+
+	t.Run("avg_aggregation_not_supported", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "log", Timestamp: now},
+		}
+
+		testUnsupportedQuery(t, ctx, `avg(count_over_time({app="test"}[5m]))`, testData)
+	})
+
+	t.Run("count_aggregation_not_supported", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "log", Timestamp: now},
+		}
+
+		testUnsupportedQuery(t, ctx, `count(count_over_time({app="test"}[5m]))`, testData)
+	})
+}
+
+// ============================================================================
+// INSTANT VECTOR QUERY TESTS (NOT SUPPORTED)
+// ============================================================================
+
+func TestInstantVectorQueries(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	testData := []LogEntry{
+		{Labels: `{app="test"}`, Line: "log", Timestamp: now},
+	}
+
+	t.Run("count_over_time_not_supported", func(t *testing.T) {
+		testUnsupportedQuery(t, ctx, `count_over_time({app="test"}[5m])`, testData)
+	})
+
+	t.Run("rate_not_supported", func(t *testing.T) {
+		testUnsupportedQuery(t, ctx, `rate({app="test"}[5m])`, testData)
+	})
+
+	t.Run("bytes_over_time_not_supported", func(t *testing.T) {
+		testUnsupportedQuery(t, ctx, `bytes_over_time({app="test"}[5m])`, testData)
+	})
+
+	t.Run("bytes_rate_not_supported", func(t *testing.T) {
+		testUnsupportedQuery(t, ctx, `bytes_rate({app="test"}[5m])`, testData)
+	})
+}
+
+// ============================================================================
+// COMPLEX QUERY TESTS
+// ============================================================================
+
+func TestComplexQueries(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	t.Run("multiple_line_filters", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "error: connection failed", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "error: timeout", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "info: connection ok", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test"} |= "error" |= "connection"`, testData)
+
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 1, totalEntries, "should return 1 log containing both 'error' AND 'connection'")
+
+		// Verify content
+		for _, stream := range streams {
+			for _, entry := range stream.Entries {
+				require.Contains(t, entry.Line, "error")
+				require.Contains(t, entry.Line, "connection")
 			}
+		}
+		t.Logf("✓ Multiple line filters work correctly: got %d entry", totalEntries)
+	})
 
-			// Clean up all records
-			for _, r := range records {
-				if rec, ok := r.(interface{ Release() }); ok {
-					rec.Release()
-				}
-			}
+	t.Run("line_filter_json_parsing_label_filter", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: `{"level":"error","msg":"timeout"}`, Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test"}`, Line: `{"level":"info","msg":"success"}`, Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test"}`, Line: `{"level":"error","msg":"failed"}`, Timestamp: now.Add(-1 * time.Minute)},
+		}
 
-			if tc.expectExecError && totalRows == 0 {
-				t.Logf("⊙ PARTIAL SUPPORT: Execution returned no data")
-				t.Logf("  Expected %d rows when fully implemented", tc.expectedRowCount)
-				return
-			}
+		streams := testLogQuery(t, ctx, `{app="test"} |= "level" | json | level="error"`, testData)
 
-			t.Logf("✓ Execution succeeded - %d rows", totalRows)
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 JSON logs with level=error")
+		t.Logf("✓ Complex query works: got %d entries", totalEntries)
+	})
 
-			if tc.expectedRowCount >= 0 {
-				require.Equal(t, int64(tc.expectedRowCount), totalRows, "row count mismatch")
-				t.Logf("✓ Result verification passed: got expected %d rows", tc.expectedRowCount)
-			}
+	t.Run("regex_selector_line_filter_drop", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test-1", env="prod"}`, Line: "error occurred", Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="test-2", env="dev"}`, Line: "error failed", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="other", env="prod"}`, Line: "info success", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app=~"test.*"} |= "error" | drop env`, testData)
+
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs containing 'error'")
+		t.Logf("✓ Complex query with drop works: got %d entries", totalEntries)
+	})
+}
+
+// ============================================================================
+// DIRECTION TESTS
+// ============================================================================
+
+func TestQueryDirection(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+
+	t.Run("backward_direction", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test"}`, Line: "log 1", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test"}`, Line: "log 2", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		streams := testLogQuery(t, ctx, `{app="test"}`, testData)
+
+		var totalEntries int
+		for _, stream := range streams {
+			totalEntries += len(stream.Entries)
+		}
+		require.Equal(t, 2, totalEntries, "should return 2 logs")
+		t.Logf("✓ Backward direction works: got %d entries", totalEntries)
+	})
+
+	t.Run("forward_direction_not_supported", func(t *testing.T) {
+		ingester := setupTestIngesterWithData(t, ctx, "test-tenant", map[string][]string{
+			`{app="test"}`: {"log 1", "log 2", "log 3"},
 		})
-	}
+		defer ingester.Close()
+
+		q := &mockQuery{
+			statement: `{app="test"}`,
+			start:     now.Add(-1 * time.Hour).Unix(),
+			end:       now.Add(1 * time.Hour).Unix(),
+			direction: logproto.FORWARD, // FORWARD not supported
+			limit:     100,
+		}
+
+		_, err := logical.BuildPlan(q)
+		require.Error(t, err, "FORWARD direction should not be supported")
+		require.Contains(t, err.Error(), "forward")
+		t.Logf("✗ FORWARD direction correctly rejected: %v", err)
+	})
 }
