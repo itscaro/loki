@@ -41,6 +41,16 @@ func newStreamsResultBuilder(dir logproto.Direction, categorizeLabels bool) *str
 	}
 }
 
+func NewStreamsResultBuilder(dir logproto.Direction, categorizeLabels bool) *streamsResultBuilder {
+	return &streamsResultBuilder{
+		direction:        dir,
+		categorizeLabels: categorizeLabels,
+		data:             make(logqlmodel.Streams, 0),
+		streams:          make(map[string]int),
+		rowBuilders:      nil,
+	}
+}
+
 type streamsResultBuilder struct {
 	direction        logproto.Direction
 	categorizeLabels bool
@@ -292,6 +302,13 @@ type vectorResultBuilder struct {
 }
 
 func newVectorResultBuilder() *vectorResultBuilder {
+	return &vectorResultBuilder{
+		data:        promql.Vector{},
+		lblsBuilder: labels.NewBuilder(labels.EmptyLabels()),
+	}
+}
+
+func NewVectorResultBuilder() *vectorResultBuilder {
 	return &vectorResultBuilder{
 		data:        promql.Vector{},
 		lblsBuilder: labels.NewBuilder(labels.EmptyLabels()),
