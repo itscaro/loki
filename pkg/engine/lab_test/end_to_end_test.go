@@ -1,4 +1,4 @@
-package engine
+package engine_lab
 
 /*
 ================================================================================
@@ -79,8 +79,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/go-kit/log"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/loki/v3/pkg/engine"
 	"github.com/grafana/loki/v3/pkg/engine/internal/executor"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/logical"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/physical"
@@ -89,6 +92,8 @@ import (
 	"github.com/grafana/loki/v3/pkg/engine/internal/util/dag"
 	"github.com/grafana/loki/v3/pkg/engine/internal/workflow"
 	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/metadata"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 )
 
 // ============================================================================
@@ -703,8 +708,6 @@ func TestEndToEnd_MetricQuery(t *testing.T) {
 		/*
 		   Metric query execution differs from log queries:
 
-		   NOW EXECUTES AGAINST REAL STORAGE.
-
 		   1. Scan tasks read log entries (same as log queries)
 		   2. RangeAggregation task counts entries per time window:
 		      - Groups by stream labels + timestamp bucket
@@ -772,7 +775,10 @@ func TestEndToEnd_MetricQuery(t *testing.T) {
 
 		t.Logf("\n=== METRIC QUERY EXECUTION ON REAL STORAGE ===")
 
-		// Read metric results
+		// Use the production vectorResultBuilder from pkg/engine/compat.go
+		// to build promql.Vector results from Arrow RecordBatches.
+		builder := engine.NewVectorResultBuilder()
+
 		for {
 			rec, err := pipeline.Read(execCtx)
 			if errors.Is(err, executor.EOF) {
@@ -780,18 +786,65 @@ func TestEndToEnd_MetricQuery(t *testing.T) {
 			}
 			require.NoError(t, err)
 
-			if rec.NumRows() > 0 {
-				t.Logf("Read metric RecordBatch: %d rows", rec.NumRows())
-
-				// Inspect the schema to find value and label columns
-				for i := 0; i < int(rec.NumCols()); i++ {
-					field := rec.Schema().Field(i)
-					t.Logf("  Column %d: %s", i, field.Name)
-				}
+			t.Logf("Read metric RecordBatch: %d rows, %d cols", rec.NumRows(), rec.NumCols())
+			for i := 0; i < int(rec.NumCols()); i++ {
+				field := rec.Schema().Field(i)
+				t.Logf("  Column %d: %s (type=%s)", i, field.Name, field.Type)
 			}
 
+			// Collect record data into promql.Samples
+			builder.CollectRecord(rec)
 			rec.Release()
 		}
+
+		require.Greater(t, builder.Len(), 0, "result vector should not be empty")
+
+		// Build the logqlmodel.Result from collected samples and extract the promql.Vector
+		metaCtx, _ := metadata.NewContext(context.Background())
+		result := builder.Build(stats.Result{}, metaCtx)
+		vector, ok := result.Data.(promql.Vector)
+		require.True(t, ok, "result data should be promql.Vector, got %T", result.Data)
+
+		t.Logf("\n=== RESULT VERIFICATION (promql.Vector) ===")
+		t.Logf("Vector length: %d", len(vector))
+		for i, sample := range vector {
+			t.Logf("  Sample %d: T=%d, F=%v, Metric=%s", i, sample.T, sample.F, sample.Metric.String())
+		}
+
+		// Expected result for: sum by (level) (count_over_time({app="test"}[5m]))
+		// Given test data:
+		//   - 5 error level entries
+		//   - 2 info level entries
+		// Note: Vector samples are sorted by labels.Compare() in Build()
+		expectedVector := promql.Vector{
+			{
+				Metric: labels.FromStrings("level", "error"),
+				F:      5.0,
+			},
+			{
+				Metric: labels.FromStrings("level", "info"),
+				F:      2.0,
+			},
+		}
+
+		// Verify we got the expected number of samples
+		require.Equal(t, len(expectedVector), len(vector), "unexpected number of vector samples")
+
+		// Verify each sample (ignoring timestamp as it varies)
+		for _, expected := range expectedVector {
+			found := false
+			for _, actual := range vector {
+				if labels.Equal(expected.Metric, actual.Metric) {
+					require.Equal(t, expected.F, actual.F, "value mismatch for metric %s", expected.Metric.String())
+					t.Logf("✓ Verified: %s = %v", expected.Metric.String(), expected.F)
+					found = true
+					break
+				}
+			}
+			require.True(t, found, "expected metric %s not found in result", expected.Metric.String())
+		}
+
+		t.Logf("✓ All expected promql.Vector samples verified!")
 
 		/*
 		   Expected Result:
