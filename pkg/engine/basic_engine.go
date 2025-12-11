@@ -71,6 +71,14 @@ type Basic struct {
 	metastore metastore.Metastore
 	bucket    objstore.Bucket
 	cfg       ExecutorConfig
+
+	// testCatalog is an optional catalog override for testing purposes.
+	testCatalog physical.Catalog
+}
+
+// SetTestCatalog sets a catalog override for testing purposes.
+func (e *Basic) SetTestCatalog(catalog physical.Catalog) {
+	e.testCatalog = catalog
 }
 
 // Query implements [logql.Engine].
@@ -154,7 +162,12 @@ func (e *Basic) Execute(ctx context.Context, params logql.Params) (logqlmodel.Re
 
 		timer := prometheus.NewTimer(e.metrics.physicalPlanning)
 
-		catalog := physical.NewMetastoreCatalog(ctx, e.metastore)
+		var catalog physical.Catalog
+		if e.testCatalog != nil {
+			catalog = e.testCatalog
+		} else {
+			catalog = physical.NewMetastoreCatalog(ctx, e.metastore)
+		}
 		planner := physical.NewPlanner(physical.NewContext(params.Start(), params.End()), catalog)
 		plan, err := planner.Build(logicalPlan)
 		if err != nil {

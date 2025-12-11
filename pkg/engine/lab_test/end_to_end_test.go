@@ -83,6 +83,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/loki/v3/pkg/dataobj/metastore"
 	"github.com/grafana/loki/v3/pkg/engine"
 	"github.com/grafana/loki/v3/pkg/engine/internal/executor"
 	"github.com/grafana/loki/v3/pkg/engine/internal/planner/logical"
@@ -92,6 +93,8 @@ import (
 	"github.com/grafana/loki/v3/pkg/engine/internal/util/dag"
 	"github.com/grafana/loki/v3/pkg/engine/internal/workflow"
 	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
 	"github.com/grafana/loki/v3/pkg/logqlmodel/metadata"
 	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 )
@@ -1480,4 +1483,254 @@ KEY DESIGN PRINCIPLES
 
 ================================================================================
 `)
+}
+
+// ============================================================================
+// SIMPLE ENGINE V2 QUERY INTERFACE
+// ============================================================================
+
+/*
+TestEngineV2_QueryInterface is a simple test for experimenting with Engine V2.
+Just change the query variable and resultType to see different query results.
+
+Usage:
+1. Modify the 'query' variable to test different LogQL queries
+2. Set 'resultType' to "log" or "metric" to control output format
+3. Run the test to see results
+*/
+func TestEngineV2_QueryInterface(t *testing.T) {
+	// ============================================================================
+	// SETUP - Test data
+	// ============================================================================
+	ctx := context.Background()
+
+	// Create test data
+	ingester := setupTestIngesterWithTimestamps(t, ctx, "test-tenant", []LogEntry{
+		{
+			Labels:    `{app="web", level="error"}`,
+			Line:      "error: connection timeout",
+			Timestamp: time.Now().Add(-10 * time.Minute),
+		},
+		{
+			Labels:    `{app="web", level="error"}`,
+			Line:      "error: database unavailable",
+			Timestamp: time.Now().Add(-9 * time.Minute),
+		},
+		{
+			Labels:    `{app="web", level="info"}`,
+			Line:      "info: request processed successfully",
+			Timestamp: time.Now().Add(-8 * time.Minute),
+		},
+		{
+			Labels:    `{app="api", level="error"}`,
+			Line:      "error: authentication failed",
+			Timestamp: time.Now().Add(-7 * time.Minute),
+		},
+		{
+			Labels:    `{app="api", level="info"}`,
+			Line:      "info: health check passed",
+			Timestamp: time.Now().Add(-6 * time.Minute),
+		},
+	})
+	defer ingester.Close()
+
+	// ============================================================================
+	// CONFIGURATION - CHANGE THESE TO EXPERIMENT
+	// ============================================================================
+
+	// Change this query to test different LogQL expressions
+	query := `{app="web"} |= "error"`
+
+	// Set to "log" for logqlmodel.Streams or "metric" for promql.Vector
+	resultType := "log"
+
+	// Set to "basic" for simple sequential execution or "standard" for distributed execution
+	// "basic" = no workers/scheduler needed, simpler and faster for testing (RECOMMENDED)
+	// "standard" = full distributed execution with workers and scheduler (currently has issues)
+	//
+	engineType := "standard"
+
+	// Create test logger that outputs to test log
+	logger := log.With(log.NewLogfmtLogger(log.NewSyncWriter(&testLogWriter{t: t})), "test", t.Name())
+
+	// ============================================================================
+	// SETUP - Engine (based on engineType)
+	// ============================================================================
+	var executeFunc func(context.Context, *mockQuery) (logqlmodel.Result, error)
+
+	switch engineType {
+	case "basic":
+		executeFunc = setupBasicEngine(t, ctx, logger, ingester)
+	case "standard":
+		executeFunc = setupStandardEngine(t, ctx, logger, ingester)
+	default:
+		t.Fatalf("Unknown engine type: %s (use 'basic' or 'standard')", engineType)
+	}
+
+	// ============================================================================
+	// EXECUTE QUERY
+	// ============================================================================
+	t.Logf("\n=== EXECUTING QUERY ===")
+	t.Logf("Query: %s", query)
+	t.Logf("Engine Type: %s", engineType)
+	t.Logf("Result Type: %s", resultType)
+
+	now := time.Now()
+	var params *mockQuery
+
+	if resultType == "metric" {
+		params = &mockQuery{
+			statement: query,
+			start:     now.Add(-15 * time.Minute).Unix(),
+			end:       now.Unix(),
+			interval:  5 * time.Minute,
+		}
+	} else {
+		params = &mockQuery{
+			statement: query,
+			start:     now.Add(-1 * time.Hour).Unix(),
+			end:       now.Unix(),
+			direction: logproto.BACKWARD,
+			limit:     100,
+		}
+	}
+
+	execCtx := ctxWithTenant(ctx, "test-tenant")
+	result, err := executeFunc(execCtx, params)
+	require.NoError(t, err)
+
+	// ============================================================================
+	// DISPLAY RESULTS
+	// ============================================================================
+	t.Logf("\n=== RESULTS ===")
+	t.Logf("Result type: %T", result.Data)
+	t.Logf("Statistics: %+v", result.Statistics)
+
+	if resultType == "log" {
+		// Display as log streams
+		if streams, ok := result.Data.(logqlmodel.Streams); ok {
+			t.Logf("\nNumber of streams: %d", len(streams))
+			for i, stream := range streams {
+				t.Logf("\nStream %d: %s", i+1, stream.Labels)
+				t.Logf("  Entries: %d", len(stream.Entries))
+				for j, entry := range stream.Entries {
+					t.Logf("    [%d] %v: %s", j+1, entry.Timestamp, entry.Line)
+				}
+			}
+
+			totalEntries := 0
+			for _, stream := range streams {
+				totalEntries += len(stream.Entries)
+			}
+			t.Logf("\n✓ Total entries: %d", totalEntries)
+		} else {
+			t.Logf("⚠ Result is not logqlmodel.Streams, got: %T", result.Data)
+		}
+	} else {
+		// Display as metric vector
+		if vector, ok := result.Data.(promql.Vector); ok {
+			t.Logf("\nVector samples: %d", len(vector))
+			for i, sample := range vector {
+				t.Logf("  Sample %d:", i+1)
+				t.Logf("    Metric: %s", sample.Metric)
+				t.Logf("    Value: %v", sample.F)
+				t.Logf("    Timestamp: %v", time.Unix(sample.T/1000, 0))
+			}
+			t.Logf("\n✓ Total samples: %d", len(vector))
+		} else {
+			t.Logf("⚠ Result is not promql.Vector, got: %T", result.Data)
+		}
+	}
+
+	t.Logf("\n=== QUERY COMPLETE ===")
+}
+
+// testLogWriter writes log output to the test log
+type testLogWriter struct {
+	t testingT
+}
+
+func (w *testLogWriter) Write(p []byte) (n int, err error) {
+	w.t.Logf("%s", p)
+	return len(p), nil
+}
+
+// setupBasicEngine creates a basic engine (no workers/scheduler needed)
+func setupBasicEngine(t *testing.T, ctx context.Context, logger log.Logger, ingester *TestIngester) func(context.Context, *mockQuery) (logqlmodel.Result, error) {
+	t.Helper()
+
+	// Create basic engine - simpler, no distributed execution
+	basicEng := engine.NewBasic(
+		engine.ExecutorConfig{BatchSize: 100},
+		metastore.Config{},
+		ingester.Bucket(),
+		logql.NoLimits,
+		nil,
+		logger,
+	)
+
+	// Override catalog for basic engine too
+	basicEng.SetTestCatalog(ingester.Catalog())
+
+	return func(ctx context.Context, params *mockQuery) (logqlmodel.Result, error) {
+		return basicEng.Execute(ctx, params)
+	}
+}
+
+// setupStandardEngine creates a standard engine with workers and scheduler
+func setupStandardEngine(t *testing.T, ctx context.Context, logger log.Logger, ingester *TestIngester) func(context.Context, *mockQuery) (logqlmodel.Result, error) {
+	t.Helper()
+
+	// Create scheduler
+	scheduler, err := engine.NewScheduler(engine.SchedulerParams{
+		Logger: logger,
+	})
+	require.NoError(t, err)
+
+	// Start the scheduler service
+	require.NoError(t, scheduler.Service().StartAsync(ctx))
+	t.Cleanup(func() {
+		scheduler.Service().StopAsync()
+		_ = scheduler.Service().AwaitTerminated(ctx)
+	})
+	require.NoError(t, scheduler.Service().AwaitRunning(ctx))
+
+	// Create and start a worker to execute tasks
+	// Use 2 threads to handle multiple tasks concurrently
+	worker, err := engine.NewWorker(engine.WorkerParams{
+		Logger:         logger,
+		Bucket:         ingester.Bucket(),
+		Config:         engine.WorkerConfig{WorkerThreads: 16},
+		Executor:       engine.ExecutorConfig{BatchSize: 100},
+		LocalScheduler: scheduler,
+	})
+	require.NoError(t, err)
+
+	// Start the worker service
+	require.NoError(t, worker.Service().StartAsync(ctx))
+	t.Cleanup(func() {
+		worker.Service().StopAsync()
+		_ = worker.Service().AwaitTerminated(ctx)
+	})
+	require.NoError(t, worker.Service().AwaitRunning(ctx))
+
+	// Create the standard engine
+	eng, err := engine.New(engine.Params{
+		Logger:     logger,
+		Registerer: nil,
+		Config: engine.ExecutorConfig{
+			BatchSize: 100,
+		},
+		Scheduler: scheduler,
+		Bucket:    ingester.Bucket(),
+		Limits:    logql.NoLimits,
+	})
+	require.NoError(t, err)
+
+	// Override the catalog to use our test ingester's catalog
+	eng.SetTestCatalog(ingester.Catalog())
+
+	return func(ctx context.Context, params *mockQuery) (logqlmodel.Result, error) {
+		return eng.Execute(ctx, params)
+	}
 }

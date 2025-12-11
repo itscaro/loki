@@ -107,6 +107,10 @@ type Engine struct {
 	limits    logql.Limits    // Limits to apply to engine queries.
 
 	metastore metastore.Metastore
+
+	// testCatalog is an optional catalog override for testing purposes.
+	// When set, it will be used instead of creating a catalog from the metastore.
+	testCatalog physical.Catalog
 }
 
 // New creates a new Engine.
@@ -134,6 +138,13 @@ func New(params Params) (*Engine, error) {
 	}
 
 	return e, nil
+}
+
+// SetTestCatalog sets a catalog override for testing purposes.
+// This allows tests to provide their own catalog implementation instead of
+// using the metastore-based catalog.
+func (e *Engine) SetTestCatalog(catalog physical.Catalog) {
+	e.testCatalog = catalog
 }
 
 // Execute executes the given query. Execute returns [ErrNotSupported] if params
@@ -307,7 +318,13 @@ func (e *Engine) buildPhysicalPlan(ctx context.Context, logger log.Logger, param
 
 	// TODO(rfratto): To improve the performance of the physical planner, we
 	// may want to parallelize metastore lookups across scheduled tasks as well.
-	catalog := physical.NewMetastoreCatalog(ctx, e.metastore)
+	var catalog physical.Catalog
+	if e.testCatalog != nil {
+		// Use test catalog override if provided
+		catalog = e.testCatalog
+	} else {
+		catalog = physical.NewMetastoreCatalog(ctx, e.metastore)
+	}
 
 	// TODO(rfratto): It feels strange that we need to past the start/end time
 	// to the physical planner. Isn't it already represented by the logical
