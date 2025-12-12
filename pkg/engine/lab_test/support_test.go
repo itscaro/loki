@@ -546,7 +546,6 @@ func TestParsers(t *testing.T) {
 
 		streams := testLogQuery(t, ctx, `{app="json-app"} | json`, testData)
 
-		// BUG: Returns all 2 logs due to label selector bug
 		var totalEntries int
 		for _, stream := range streams {
 			totalEntries += len(stream.Entries)
@@ -574,17 +573,18 @@ func TestParsers(t *testing.T) {
 
 	t.Run("logfmt_parser", func(t *testing.T) {
 		testData := []LogEntry{
-			{Labels: `{app="logfmt-app"}`, Line: `level=error msg="connection refused"`, Timestamp: now.Add(-2 * time.Minute)},
-			{Labels: `{app="logfmt-app"}`, Line: `level=info msg="request ok"`, Timestamp: now.Add(-1 * time.Minute)},
+			{Labels: `{app="logfmt-app"}`, Line: `level=error msg="connection refused"`, Timestamp: now.Add(-3 * time.Minute)},
+			{Labels: `{app="logfmt-app"}`, Line: `level=info msg="request ok"`, Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="logfmt-app"}`, Line: `level=info msg="database" trace="foo"`, Timestamp: now.Add(-1 * time.Minute)},
 		}
 
-		streams := testLogQuery(t, ctx, `{app="logfmt-app"} | logfmt`, testData)
+		streams := testLogQuery(t, ctx, `{app="logfmt-app"} | logfmt | trace="foo"`, testData)
 
 		var totalEntries int
 		for _, stream := range streams {
 			totalEntries += len(stream.Entries)
 		}
-		require.Equal(t, 2, totalEntries, "should return 2 logs")
+		require.Equal(t, 1, totalEntries, "should return 1 logs")
 		t.Logf("✓ Logfmt parser works: got %d entries", totalEntries)
 	})
 
@@ -628,6 +628,15 @@ func TestLabelManipulation(t *testing.T) {
 		}
 		require.Equal(t, 2, totalEntries, "should return 2 logs (drop doesn't filter)")
 		t.Logf("✓ Drop labels works: got %d entries", totalEntries)
+	})
+
+	t.Run("drop_labels_with_matchers", func(t *testing.T) {
+		testData := []LogEntry{
+			{Labels: `{app="test", env="prod"}`, Line: "log 1", Timestamp: now.Add(-2 * time.Minute)},
+			{Labels: `{app="test", env="dev"}`, Line: "log 2", Timestamp: now.Add(-1 * time.Minute)},
+		}
+
+		testUnsupportedQuery(t, ctx, `{app="test"} | drop env="dev"`, testData)
 	})
 
 	t.Run("keep_labels_not_supported", func(t *testing.T) {
